@@ -1,0 +1,18 @@
+# Core numerical and reinforcement-learning stack
+numpy>=2.0
+torch>=2.7
+torchvision>=0.22
+# Extras de Gymnasium (renderizado, vídeo y dependencias auxiliares)
+gymnasium[other]>=1.1
+stable-baselines3>=2.7
+
+# Environment rendering and media export
+opencv-python>=4.10
+imageio>=2.37
+imageio-ffmpeg>=0.6
+
+# Training, diagnostics, and examples
+matplotlib>=3.9
+tensorboard>=2.18
+tqdm>=4.67
+rich>=13.9
