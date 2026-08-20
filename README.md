@@ -1,138 +1,222 @@
 # Starship V1: terminal landing with reinforcement learning
 
-An educational 2D project that explores how a **Soft Actor-Critic (SAC)**
-agent can control a simplified *belly flop*, *flip*, and *landing burn*
-manoeuvre to a landing pad.
+An educational 2D environment in which a **Soft Actor-Critic (SAC)** agent
+learns the terminal portion of a Starship-inspired landing: belly flop, flip,
+braking manoeuvre, touchdown, engine shutdown, and post-contact stability.
 
-> This is not a flight simulator or a model of Starship operational software.
-> It uses vehicle-inspired orders of magnitude to provide physical context for
-> a reproducible reinforcement-learning problem that can be expanded over time.
+> [!IMPORTANT]
+> This is not a high-fidelity flight simulator and does not reproduce SpaceX
+> flight software. Vehicle-inspired orders of magnitude provide physical
+> context for a reinforcement-learning experiment that can be expanded in
+> controlled increments.
 
-The project is designed to increase complexity **incrementally**. Each version
-should add one layer, retain a trainable task, and allow meaningful comparison:
-first terminal control with one actuator; then multiple engines and thrust
-allocation; later fuel, ignition constraints, weather disturbances, wind,
-sensors, and other sources of uncertainty.
+V1 deliberately uses one centred virtual actuator. Later versions can add
+independent engines, propellant, ignition constraints, failures, weather,
+sensors, and other sources of uncertainty without hiding the learning problem
+behind all of that complexity from the beginning.
 
-## Acknowledgement and original project
+## Acknowledgement
 
-This repository is based on **[Rocket-recycling with Reinforcement
-Learning](https://github.com/jiupinjia/rocket-recycling)** by
-**[Zhengxia Zou, Ph.D.](https://zhengxiazou.github.io/)**. Many thanks to
-Zhengxia Zou for publishing the original environment and making this excellent
-educational starting point available.
+This repository is based on
+**[Rocket-recycling with Reinforcement Learning](https://github.com/jiupinjia/rocket-recycling)**
+by **[Zhengxia Zou, Ph.D.](https://zhengxiazou.github.io/)**. Many thanks to
+Zhengxia Zou for publishing the original environment and providing an
+excellent educational starting point.
 
-The recovered foundation retains the original idea: a rigid rocket in a 2D
-plane, thrust vectoring, and reinforcement learning. This branch reorganises
-the experiment as a deliberately simple first version of Starship terminal
-landing.
+This project adapts that foundation to a staged Starship terminal-landing
+experiment. The original project and this derivative are not affiliated with
+SpaceX.
 
-## What V1 learns
+## V1 at a glance
 
-V1 solves one task: start in a belly-flop state, orient the vehicle, discover
-an effective braking strategy, and settle safely on the pad.
+| Property | V1 value |
+| --- | ---: |
+| Simulation | 2D rigid body |
+| Vehicle mass | 140,000 kg |
+| Vehicle height | 50 m |
+| Virtual actuator | One centred, up to 6 MN |
+| Physics timestep | 0.05 s (20 Hz) |
+| Policy observations | 12 |
+| Continuous actions | 2 |
+| Episode limit | 750 steps (37.5 s) |
+| Learning algorithm | Soft Actor-Critic |
 
-The agent receives two continuous actions:
+The 6 MN actuator represents simplified aggregate control authority. It is not
+the specification of an individual Raptor engine.
 
-| Action | Range | Meaning |
-| --- | --- | --- |
-| `throttle` | `0..1` | Total thrust of the virtual actuator. |
-| `gimbal` | `-1..1` | Thrust direction, scaled to ±30°. |
+## Environment
 
-Individual ignition, shutdown, and thrust allocation are outside the scope of
-this version. This is intentional: it reduces the action space so the
-experiment focuses on the manoeuvre itself. Three-engine control will be a
-later extension.
+### Physics
 
-## Main changes from the original repository
+`rocket.py` models:
 
-### V1 centred single-engine environment
+- gravity and rigid-body translational and rotational inertia;
+- orientation-dependent aerodynamic drag;
+- aerodynamic angular damping;
+- a restoring aerodynamic moment during the high-altitude belly flop;
+- gimballed thrust and its torque around the centre of mass;
+- ground contact, impact limits, settling, and tip-over detection.
 
-- `v1_single_engine` is added and selected by default in `main.py`.
-- Three engines are replaced by a centred virtual actuator with up to **6 MN**
-  of total thrust. It is centred, so it does not generate torque through an
-  engine offset; rotation is controlled through gimbal.
-- Mass is **140,000 kg** and height is **50 m**. V1 inertia uses a rigid
-  cylinder approximation.
-- Control is continuous: shutting down the engine neither locks it out nor
-  imposes a minimum throttle. On ground contact, engines are cut and the
-  environment validates stability on the landing legs.
+The restoring aerodynamic moment is fully active above 450 m AGL and fades
+between 450 m and 350 m AGL. The reward and observation attitude reference
+transitions from an 80-degree belly flop at 450 m to vertical at 250 m. This
+gives the policy control authority during the flip while retaining a simplified
+aerodynamic belly-flop phase.
 
-### Physics, phases, and symmetry
+V1 does not include six-degree-of-freedom motion, fuel consumption, changing
+mass, flaps, RCS, wind, weather, sensor noise, or individual engine dynamics.
 
-- Episodes start randomly to the left or right of the pad, **150–200 m** away,
-  at **500–600 m AGL**, with initial `vy` between **−95 and −85 m/s** and a
-  **75–85°** belly-flop attitude.
-- The attitude reference transitions from 80° to upright between **450 m and
-  250 m AGL**. The restoring aerodynamic moment fades progressively from
-  **450 m to 350 m**, giving gimbal control authority to complete the flip.
-- V1 aerodynamics use the geometric projection between the vehicle axis and
-  its velocity vector. Mirrored left/right states therefore create the same
-  drag and reflected dynamics, removing the asymmetry caused by a fixed angular
-  reference.
-- The effective touchdown area is **±15 m** from the pad centre. Contact also
-  requires safe impact speed, attitude, and angular rate. The vehicle must
-  remain stable for 20 steps with engines off; a further second is simulated so
-  the green success state is visible in the video.
+### Observation vector
 
-### Progress-based rewards
+Only V1 uses the compact 12-value observation returned by `_flatten_v1()`:
 
-`improved_rewards_v1.py` combines progress shaping with terminal signals. It
-does **not** prescribe a vertical-speed profile or burn altitude. Instead, it:
+| Index | Observation | Internal scaling |
+| ---: | --- | --- |
+| 0 | Horizontal position `x` | `x / 200` |
+| 1 | Altitude above ground level | `AGL / 600` |
+| 2 | Horizontal velocity `vx` | `vx / 50` |
+| 3 | Vertical velocity `vy` | `vy / 100` |
+| 4 | `sin(theta)` | Already bounded |
+| 5 | `cos(theta)` | Already bounded |
+| 6 | Angular velocity | Clipped to `[-2, 2]` |
+| 7 | Current throttle | `[0, 1]` |
+| 8 | Current gimbal | Divided by 30 degrees |
+| 9 | Phase-dependent attitude error | Divided by `pi` |
+| 10 | Signed braking margin | Divided by 100 |
+| 11 | Remaining episode fraction | `[0, 1]` |
 
-- rewards reducing altitude, pad error, attitude error, and lateral velocity;
-- uses rewards based on state change rather than occupying a centred or upright
-  state, so a hover cannot farm reward indefinitely;
-- estimates a braking safety envelope from altitude, downward speed, and
-  available deceleration; it penalises states that can no longer reach a safe
-  touchdown, without prescribing a burn altitude or velocity profile;
-- penalises ascent, angular rate, control effort, and elapsed time;
-- lets the agent discover its own late or conservative braking solution;
-- assigns `+300` for landing, `-250` for a crash, and `-200` for a timeout.
+`VecNormalize` then normalises these observations during training. A checkpoint
+must therefore be evaluated or resumed with its associated
+`vec_normalize.pkl` file.
 
-## Success conditions
+Attitude error and braking margin are engineered observations. V1 is not
+claiming that guidance emerged from entirely raw sensor measurements.
 
-Touching the ground alone is not a successful episode. V1 separates impact
-validation from post-contact stability validation:
+### Actions
 
-| Stage | Requirement |
-| --- | --- |
-| Valid contact | Total impact speed `< 7 m/s`, vertical component `< 6 m/s`, `|x| < 15 m`, and attitude `< 10°`. |
-| Pad stability | Vehicle on the ground, speed `< 5 m/s`, `|x| < 15 m`, attitude `< 5°`, angular rate `< 3°/s`, and engine off. |
-| Confirmation | Stability conditions must hold for **20 consecutive steps** (1 second at `dt = 0.05 s`). |
-| Display | After reaching 20/20, the environment runs for 20 more steps to show the green success state in the video. |
+The actor emits two continuous commands:
 
-If the vehicle leaves the ±15 m zone, exceeds impact limits, tips over, or
-fails to stabilise within the two seconds after first contact, the episode ends
-as a crash. The automatic engine cut-off after contact prevents a policy from
-turning a touchdown into another take-off during this validation.
+| Action | Policy range | Physical interpretation |
+| --- | ---: | --- |
+| Throttle | `[0, 1]` | Cubed before it reaches the actuator, providing finer low-thrust control |
+| Gimbal | `[-1, 1]` | Scaled to `+/-30` degrees |
 
-## Algorithm and current configuration
+Gimbal movement is rate-limited to one degree per physics step. With a 20 Hz
+simulation, the maximum commanded gimbal rate is therefore 20 degrees/s.
 
-The project uses Stable-Baselines3 SAC, observations normalised with
-`VecNormalize`, and several parallel environments.
+## Curriculum learning
+
+The complete manoeuvre was too difficult to explore reliably from random SAC
+actions. V1 therefore changes only the initial-state distribution across three
+phases; physics, observations, actions, rewards, and touchdown conditions stay
+the same.
+
+Initial states are mirrored around `x = 0`. Horizontal velocity points towards
+the pad and the attitude/angular-rate signs follow the side from which the
+vehicle approaches.
+
+| Phase | AGL | Absolute x | Inward vx | vy | Absolute tilt | Angular rate |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `phase_1` | 80-150 m | 20-25 m | 3 m/s | -25 to -12 m/s | 3-8 deg, plus +/-2 deg noise | 0 deg/s |
+| `phase_2` | 180-300 m | 30-50 m | 3-5 m/s | -40 to -25 m/s | 15-30 deg | 0-4 deg/s |
+| `phase_3` | 500-600 m | 150-200 m | 9-15 m/s | -95 to -85 m/s | 75-85 deg, plus +/-2 deg noise | 0 deg/s |
+
+`phase_1` is the default. The curriculum phase is selected explicitly with
+`--phase`; promotion is currently a manual training decision rather than an
+automatic callback.
+
+## Reward design
+
+`improved_rewards_v1.py` uses progress-based shaping. Positive dense rewards
+are changes in error, so the policy cannot farm reward merely by remaining in
+a centred hover.
+
+Positive progress terms measure reductions in:
+
+- horizontal pad error;
+- phase-dependent attitude error;
+- lateral speed;
+- braking-safety deficit.
+
+Non-positive terms apply:
+
+- a constant time cost;
+- an ascent penalty;
+- angular-rate and attitude penalties;
+- a braking-viability penalty when safe stopping distance is being exhausted;
+- stronger attitude, spin, and outside-pad penalties near the ground.
+
+V1 deliberately does **not** reward losing altitude, prescribe a vertical
+speed profile, impose a fixed burn altitude, or penalise thrust consumption.
+There is no fuel model yet. The agent remains free to discover a late or
+conservative braking strategy.
+
+Terminal rewards dominate the shaping terms:
+
+| Outcome | Reward |
+| --- | ---: |
+| Successful landing | `+300` |
+| Crash | `-250` |
+| Timeout | `-200` |
+
+## Touchdown and success conditions
+
+Crossing the ground boundary is not sufficient for success.
+
+### Impact limits
+
+At first contact, the vehicle crashes if any hard limit is violated:
+
+- total impact speed is at least 7 m/s;
+- vertical impact speed is at least 6 m/s;
+- `|x|` is at least 15 m;
+- absolute tilt is at least 10 degrees;
+- absolute angular rate is at least 5 degrees/s.
+
+### Stable landing
+
+After valid contact, all of the following must hold:
+
+- the vehicle remains on the ground;
+- total speed is below 5 m/s;
+- `|x|` is below 15 m;
+- absolute tilt is below 5 degrees;
+- absolute angular rate is below 3 degrees/s;
+- total thrust is below 1% of maximum thrust.
+
+The conditions must hold for 20 consecutive steps, or one second. The episode
+then continues for one additional second so the green success state is visible
+in recorded video. A touchdown that cannot begin stable settling within two
+seconds is classified as a crash.
+
+## SAC configuration
 
 | Parameter | Value |
 | --- | ---: |
-| Policy / critics | `[256, 256]` / `[256, 256, 256]` |
-| Initial learning rate | `3e-4` |
-| Replay buffer | `400,000` transitions |
-| Warm-up | `20,000` steps |
-| Batch size | `512` |
-| `gamma` / `tau` | `0.998` / `0.005` |
+| Actor network | `[256, 256]` |
+| Two critic networks | `[256, 256, 256]` each |
+| Learning rate | `3e-4` |
+| Replay buffer | 400,000 transitions |
+| Learning starts | 20,000 transitions |
+| Batch size | 512 |
+| Discount factor `gamma` | 0.998 |
+| Target smoothing `tau` | 0.005 |
+| Gradient steps | 3 per vector step |
 | Entropy coefficient | `auto_0.1` |
-| Parallel environments | `6` |
-| Gradient steps | `3` |
-| Default seed | `42` |
+| Parallel environments | 6 |
+| Default seed | 42 |
 
-The simulation is lightweight and mostly CPU-bound. Vectorised environments
-usually provide more performance than a larger GPU. A GPU accelerates neural
-network updates, especially with large batches, but it does not replace physics
-parallelism.
+The simulation is mostly CPU-bound. `SubprocVecEnv` runs the six training
+environments in separate processes, while evaluation and video rendering use a
+single `DummyVecEnv`. A CUDA-enabled PyTorch build can accelerate network
+updates, but it does not accelerate the Python physics processes.
+
+Reward normalisation is disabled. Observation normalisation remains enabled.
 
 ## Installation
 
-In PowerShell, from the project directory:
+Python 3.12 is the recommended environment for the current dependency stack.
+In PowerShell, from the repository directory:
 
 ```powershell
 py -3.12 -m venv .venv312
@@ -141,26 +225,31 @@ python -m pip install --upgrade pip
 python -m pip install -r Requirements.txt
 ```
 
-If you already have a working environment, activate it instead of creating a
-new one. To use CUDA, install a PyTorch build compatible with your Python,
-Windows version, and NVIDIA driver before installing or adjusting project
-dependencies.
+On Linux or macOS:
 
-## Run
+```bash
+python3.12 -m venv .venv312
+source .venv312/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r Requirements.txt
+```
 
-Train V1 from scratch:
+The default PyPI PyTorch package may be CPU-only depending on the platform and
+installer. If CUDA is required, install the wheel recommended for the local
+Python version, GPU, and NVIDIA driver using the official
+[PyTorch installation selector](https://pytorch.org/get-started/locally/).
+
+## Training
+
+Start Phase 1 from scratch:
 
 ```powershell
-python main.py
+python main.py --phase phase_1 --seed 42
 ```
 
-By default, training runs for 4 million steps and saves results to:
-
-```text
-models/v1_single_engine/
-logs/v1_single_engine/
-videos/
-```
+Fresh training currently runs for four million environment timesteps with six
+parallel environments. Models, normalisation statistics, TensorBoard events,
+and periodic videos are written under `models/`, `logs/`, and `videos/`.
 
 Start TensorBoard:
 
@@ -168,59 +257,132 @@ Start TensorBoard:
 tensorboard --logdir .\logs --port 6006
 ```
 
-Then open `http://localhost:6006`. Metrics include reward, losses, entropy,
-and touchdown/success metrics logged during training.
+Then open `http://localhost:6006`.
 
-### Evaluate a checkpoint without training
+Useful custom metrics include:
 
-An SAC checkpoint must always use the `VecNormalize` file created alongside it;
-otherwise the policy receives observations on a different scale.
+- `rollout/landing_success_rate_50`;
+- episode reward and length;
+- actor and critic losses;
+- entropy coefficient.
 
-```powershell
-python main.py --evaluate .\models\v1_single_engine\final_model.zip `
-  --vecnorm .\models\v1_single_engine\vec_normalize.pkl --episodes 10 --seed 42
-```
+## Moving to the next curriculum phase
 
-### Resume training
+Resume the Phase 1 policy in Phase 2:
 
 ```powershell
-python main.py --resume .\models\v1_single_engine\interrupted_checkpoint.zip `
-  --vecnorm .\models\v1_single_engine\vec_normalize_checkpoint.pkl `
-  --timesteps 300000 --n-envs 6 --learning-rate 1e-4 --seed 42
+python main.py `
+  --resume .\models\v1_single_engine\final_model.zip `
+  --vecnorm .\models\v1_single_engine\vec_normalize.pkl `
+  --phase phase_2 `
+  --timesteps 300000 `
+  --n-envs 6 `
+  --learning-rate 1e-4 `
+  --seed 42
 ```
 
-The replay buffer is not restored from an SAC `.zip` file. When resuming, the
-program first collects a fresh experience window before updating the network
-again. Material changes to physics, rewards, actions, or observations require
-training from scratch; previous checkpoints should not be reused.
+Then use the resulting checkpoint and normaliser to resume with
+`--phase phase_3`.
 
-## Structure
+`SAC.save()` does not include the replay buffer. Resume mode preserves the
+model weights, optimiser state, timestep counter, and `VecNormalize`
+statistics, but creates a fresh replay buffer and collects 50,000 new
+transitions before updating the network. Preserve or rename the outputs from
+each phase before launching the next one because resumed runs share the
+`models/v1_single_engine_resumed/` directory.
+
+## Deterministic evaluation
+
+Evaluate a model against a selected phase without training:
+
+```powershell
+python main.py `
+  --evaluate .\models\v1_single_engine\final_model.zip `
+  --vecnorm .\models\v1_single_engine\vec_normalize.pkl `
+  --phase phase_1 `
+  --episodes 10 `
+  --seed 42
+```
+
+The policy runs deterministically. The first episode uses the base seed and
+each subsequent episode increments it by one. Repeating the same command
+therefore reproduces the same evaluation scenarios and trajectories. Change
+the base seed or increase `--episodes` to test a different sample.
+
+Evaluation exports one MP4 per episode under `videos/evaluation/` and prints
+success, crash, timeout, reward, final altitude, and velocity summaries.
+
+## Neural activation visualisation
+
+Add `--activation-visualization` to evaluation:
+
+```powershell
+python main.py `
+  --evaluate .\models\v1_single_engine\final_model.zip `
+  --vecnorm .\models\v1_single_engine\vec_normalize.pkl `
+  --phase phase_1 `
+  --episodes 10 `
+  --seed 42 `
+  --activation-visualization
+```
+
+For every episode this additionally creates:
+
+- `episode_NN_network.gif`: sampled actor activations;
+- `episode_NN_combined.mp4`: synchronised simulation and network views.
+
+The visualiser shows a representative subset of hidden neurons; it does not
+change the policy or the inference result.
+
+Combine all activation videos and optionally accelerate them:
+
+```powershell
+python combine_evaluation_episodes.py `
+  --speed 2 `
+  --gif-fps 10 `
+  --gif-width 1000 `
+  --overwrite
+```
+
+Use `--preserve-frames` only when every source frame must be retained. It
+raises the output frame rate and can produce very large GIF files.
+
+To combine the plain simulation videos instead, change the pattern:
+
+```powershell
+python combine_evaluation_episodes.py `
+  --pattern "episode_??.mp4" `
+  --output-prefix .\videos\evaluation\simulation_episodes `
+  --speed 2 `
+  --overwrite
+```
+
+## Repository structure
 
 ```text
-main.py                 Gymnasium wrapper, SAC, callbacks, and CLI
-rocket.py               2D dynamics, contact, rendering, and engine state
-improved_rewards_v1.py  V1 phase-based rewards
-utils.py                Utilities from the recovered project
-Requirements.txt        Python dependencies
+main.py                         Gymnasium wrapper, SAC setup, callbacks, and CLI
+rocket.py                       Dynamics, contact, success logic, and rendering
+improved_rewards_v1.py          V1 progress-based reward system
+curriculum_phases.py            Initial-state distributions for Phases 1-3
+activation_visualizer.py        Actor activation GIF and combined-video export
+combine_evaluation_episodes.py  Concatenate and accelerate evaluation media
+policy.py                       Recovered policy utilities
+utils.py                        Recovered project utilities
+Requirements.txt                Python dependencies
 ```
 
-## Limitations and next versions
+Training outputs, checkpoints, TensorBoard logs, virtual environments, and
+videos are ignored by Git.
 
-V1 does not model six degrees of freedom, propellants, mass loss, weather,
-wind, flaps, RCS attitude control, sensor noise, Raptor ignition behaviour, or
-a full trajectory from tens of kilometres of altitude. Its parameters should
-therefore be interpreted as physical context, not as a reproduction of a
-SpaceX flight.
+## Roadmap
 
-A sensible roadmap for future posts and experiments is:
-
-1. **V1:** centred actuator, terminal belly flop, and stable touchdown.
-2. **V2:** three engines, throttle allocation, per-engine gimbal, and ignition
+1. **V1:** centred virtual actuator, terminal belly flop, curriculum learning,
+   and stable touchdown.
+2. **V2:** three engines, thrust allocation, per-engine gimbal, and ignition
    constraints.
 3. **V3:** fuel, variable mass, failures, and propellant-margin management.
-4. **V4:** flaps, wind, weather conditions, uncertainty, and domain
-   randomisation.
-5. **V5:** glide trajectory and transition from a higher altitude.
+4. **V4:** flaps, wind, weather, uncertainty, and domain randomisation.
+5. **V5:** a higher-altitude glide and transition into the terminal manoeuvre.
 
 ## Licence and citation
 
