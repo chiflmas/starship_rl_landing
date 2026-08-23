@@ -14,5 +14,7 @@ imageio-ffmpeg>=0.6
 # Training, diagnostics, and examples
 matplotlib>=3.9
 tensorboard>=2.18
+plotly>=6.9
+kaleido>=1.3
 tqdm>=4.67
 rich>=13.9

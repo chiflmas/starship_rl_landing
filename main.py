@@ -13,11 +13,63 @@ from rocket import Rocket
 from curriculum_phases import CURRICULUM_PHASES, DEFAULT_CURRICULUM_PHASE
 import os
 import sys
+from importlib import import_module
 from collections import defaultdict
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-DEFAULT_VERSION = "v1_single_engine"
+VERSION_CONFIGS = {
+    "v1": {
+        "description": "Single actuator with 12 observations",
+        "engine_mode": "single",
+        "observation_mode": "v1_engineered",
+        "observation_dims": 12,
+        "reward_module": "improved_rewards_v1",
+        "reward_class": "V1SingleEngineRewardSystem",
+        "output_name": "v1_single_engine",
+    },
+    "v1_1": {
+        "description": "Single actuator with 10 raw observations",
+        "engine_mode": "single",
+        "observation_mode": "v1_raw",
+        "observation_dims": 10,
+        "reward_module": "improved_rewards_v1_1",
+        "reward_class": "V11SingleEngineRewardSystem",
+        "output_name": "v1_1_single_engine",
+    },
+    "legacy_three_engine": {
+        "description": "Recovered three-engine environment",
+        "engine_mode": "three",
+        "observation_mode": "legacy",
+        "observation_dims": 23,
+        "reward_module": "improved_rewards",
+        "reward_class": "ImprovedRewardSystem",
+        "output_name": "legacy_three_engine",
+    },
+}
+
+VERSION_ALIASES = {
+    "v1_single_engine": "v1",
+    "v1_1_single_engine": "v1_1",
+}
+
+DEFAULT_VERSION = "v1"
+
+
+def resolve_version(version):
+    """Resolve a public version name and return an isolated config copy."""
+    canonical_version = VERSION_ALIASES.get(version, version)
+    if canonical_version not in VERSION_CONFIGS:
+        available = ", ".join(VERSION_CONFIGS)
+        raise ValueError(
+            f"Unknown environment version {version!r}. Available: {available}"
+        )
+    return canonical_version, dict(VERSION_CONFIGS[canonical_version])
+
+
+def load_reward_class(version_config):
+    module = import_module(version_config["reward_module"])
+    return getattr(module, version_config["reward_class"])
 
 
 def set_reproducible_seed(seed):
@@ -40,32 +92,20 @@ class StarshipGymEnv(gym.Env):
                  curriculum_phase=DEFAULT_CURRICULUM_PHASE):
         super().__init__()
         
-        self.version = version
+        self.version, self.version_config = resolve_version(version)
+        self.engine_mode = self.version_config['engine_mode']
         self.render_mode = render_mode
         self.curriculum_phase = curriculum_phase
-        engine_mode = 'single' if version == 'v1_single_engine' else 'three'
         self.rocket_env = Rocket(
             task=task,
             max_steps=max_steps,
             rocket_type='starship',
-            engine_mode=engine_mode,
+            engine_mode=self.engine_mode,
             curriculum_phase=curriculum_phase,
+            observation_mode=self.version_config['observation_mode'],
         )
-        
-        # Integrar sistema de recompensas mejorado
-        # Usar versión de fine-tuning si existe la variable global
-        import os
-        if hasattr(self.__class__, 'use_finetuning_rewards') and self.__class__.use_finetuning_rewards:
-            print("🎯 Usando improved_rewards_finetuning.py")
-            from improved_rewards_finetuning import ImprovedRewardSystem
-        else:
-            from improved_rewards import ImprovedRewardSystem
-        
-        if version == 'v1_single_engine':
-            from improved_rewards_v1 import V1SingleEngineRewardSystem
-            reward_class = V1SingleEngineRewardSystem
-        else:
-            reward_class = ImprovedRewardSystem
+
+        reward_class = load_reward_class(self.version_config)
 
         self.rocket_env.reward_system = reward_class(
             task=task,
@@ -85,7 +125,7 @@ class StarshipGymEnv(gym.Env):
             shape=(self.rocket_env.state_dims,),
             dtype=np.float32,
         )
-        if version == 'v1_single_engine':
+        if self.engine_mode == 'single':
             self.action_space = spaces.Box(
                 low=np.array([0.0, -1.0], dtype=np.float32),
                 high=np.array([1.0, 1.0], dtype=np.float32),
@@ -213,7 +253,7 @@ class StarshipGymEnv(gym.Env):
         - Para empuje 0%: Debe aprender on_signal ≤ 0 (NO throttle=0)
         - Para empuje 40-100%: Debe aprender on_signal > 0 + throttle [0,1]
         """
-        if self.version == 'v1_single_engine':
+        if self.engine_mode == 'single':
             # SAC starts near the centre of a Box action and samples uniformly
             # during learning_starts. A linear mapping therefore commands about
             # 50 % thrust, more than twice V1's hover throttle. The cubic curve
@@ -436,36 +476,41 @@ def create_optimized_sac_model(env, log_path="./logs/"):
 # ═══════════════════════════════════════════════════════════════
 
 def train_starship_sac(load=False, seed=42,
-                       curriculum_phase=DEFAULT_CURRICULUM_PHASE):
+                       curriculum_phase=DEFAULT_CURRICULUM_PHASE,
+                       version=DEFAULT_VERSION):
     """
     Entrena Starship con SAC optimizado para aterrizaje
     """
     # Configuración
     task = 'landing'
-    version = DEFAULT_VERSION
+    version, version_config = resolve_version(version)
+    output_name = version_config['output_name']
     total_timesteps = 4_000_000
     n_envs = 6
-    model_save_path = f"./models/{version}"
-    log_path = f"./logs/{version}/"
+    model_save_path = f"./models/{output_name}"
+    log_path = f"./logs/{output_name}/"
+    video_path = f"./videos/{output_name}"
     set_reproducible_seed(seed)
     
     print(f"╔══════════════════════════════════════════════╗")
     print(f"║   STARSHIP LANDING - SAC OPTIMIZADO          ║")
     print(f"╚══════════════════════════════════════════════╝")
     print(f"📊 Configuración:")
+    print(f"   • Versión: {version} ({version_config['description']})")
+    print(f"   • Observaciones: {version_config['observation_dims']}")
     print(f"   • Entornos paralelos: {n_envs}")
     print(f"   • Curriculum: {curriculum_phase}")
     print(f"   • Total timesteps: {total_timesteps:,}")
-    print(f"   • Buffer size: 300_000")
+    print(f"   • Buffer size: 400_000")
     print(f"   • Batch size: 512")
-    print(f"   • Learning starts: 10k")
-    print(f"   • Entropy: auto (target: 0.2 * action_dim)")
+    print(f"   • Learning starts: 20k")
+    print(f"   • Entropy: auto_0.1")
     print()
     
     # Crear directorios
     os.makedirs(model_save_path, exist_ok=True)
     os.makedirs(log_path, exist_ok=True)
-    os.makedirs("./videos", exist_ok=True)
+    os.makedirs(video_path, exist_ok=True)
     
     # Factory para entornos
     def env_factory():
@@ -531,7 +576,7 @@ def train_starship_sac(load=False, seed=42,
     # 4. Video recording
     video_callback = VideoRecordingCallback(
         eval_env=eval_env,
-        video_folder="./videos",
+        video_folder=video_path,
         video_frequency=30_000,
         video_length=1000,
         verbose=1
@@ -554,8 +599,8 @@ def train_starship_sac(load=False, seed=42,
     print("🚀 INICIANDO ENTRENAMIENTO SAC")
     print("="*50)
     print("📊 Monitoreo: tensorboard --logdir=./logs/")
-    print("📹 Videos guardados en: ./videos/")
-    print("💾 Modelos guardados en: ./models/")
+    print(f"📹 Videos guardados en: {video_path}/")
+    print(f"💾 Modelos guardados en: {model_save_path}/")
     print("="*50 + "\n")
     
     try:
@@ -674,8 +719,16 @@ if __name__ == "__main__":
                         help="Episodios deterministas al usar --evaluate (por defecto: 10)")
     parser.add_argument("--learning-rate", type=float, default=1e-4,
                         help="Learning rate de fine-tuning al usar --resume (por defecto: 1e-4)")
+    parser.add_argument("--warmup-steps", type=int, default=50_000,
+                        help="Transiciones nuevas antes de actualizar SAC al usar --resume (por defecto: 50000)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Semilla base para entornos, NumPy, Python y Torch (por defecto: 42)")
+    parser.add_argument(
+        "--version",
+        choices=tuple(VERSION_CONFIGS),
+        default=DEFAULT_VERSION,
+        help=f"Versión del entorno (por defecto: {DEFAULT_VERSION})",
+    )
     parser.add_argument("--phase", choices=tuple(CURRICULUM_PHASES),
                         default=DEFAULT_CURRICULUM_PHASE,
                         help=f"Fase del curriculum V1 (por defecto: {DEFAULT_CURRICULUM_PHASE})")
@@ -699,18 +752,21 @@ if __name__ == "__main__":
         print(f"📂 Cargando modelo desde: {args.resume}")
         set_reproducible_seed(args.seed)
 
-        # Configuración IDÉNTICA al entrenamiento original
+        # La versión debe coincidir con el contrato de observaciones del modelo.
         task = 'landing'
-        version = DEFAULT_VERSION
+        version, version_config = resolve_version(args.version)
+        output_name = version_config['output_name']
         total_timesteps = args.timesteps
         n_envs = args.n_envs
-        model_save_path = f"./models/{version}_resumed"
-        log_path = f"./logs/{version}_resumed/"
+        model_save_path = f"./models/{output_name}_resumed"
+        log_path = f"./logs/{output_name}_resumed/"
+        resumed_video_path = f"./videos/{output_name}_resumed"
         
         print(f"╔══════════════════════════════════════════════╗")
         print(f"║   REENTRENANDO STARSHIP - SAC OPTIMIZADO     ║")
         print(f"╚══════════════════════════════════════════════╝")
         print(f"📊 Configuración:")
+        print(f"   • Versión: {version} ({version_config['description']})")
         print(f"   • Entornos paralelos: {n_envs}")
         print(f"   • Curriculum: {args.phase}")
         print(f"   • Total timesteps: {total_timesteps:,}")
@@ -720,7 +776,7 @@ if __name__ == "__main__":
         # Crear directorios
         os.makedirs(model_save_path, exist_ok=True)
         os.makedirs(log_path, exist_ok=True)
-        os.makedirs(f"./videos/{version}_resumed", exist_ok=True)
+        os.makedirs(resumed_video_path, exist_ok=True)
         
         # Factory para entornos
         def env_factory():
@@ -766,8 +822,13 @@ if __name__ == "__main__":
         # SAC.save() no incluye el replay buffer. Antes de entrenar de nuevo,
         # llenamos un buffer nuevo con experiencias de la física/rewards
         # actuales; num_timesteps se conserva para no reiniciar los logs.
-        model.learning_starts = model.num_timesteps + 50_000
-        print("🧠 Warm-up de replay buffer: 50,000 transiciones nuevas antes de actualizar la red")
+        if args.warmup_steps < 0:
+            parser.error("--warmup-steps debe ser mayor o igual que 0")
+        model.learning_starts = model.num_timesteps + args.warmup_steps
+        print(
+            f"🧠 Warm-up de replay buffer: {args.warmup_steps:,} "
+            "transiciones nuevas antes de actualizar la red"
+        )
         print(f"🔢 Timesteps previos: {model.num_timesteps:,}")
         
         # Configurar callbacks (IDÉNTICOS al original)
@@ -788,7 +849,7 @@ if __name__ == "__main__":
         
         video_callback = VideoRecordingCallback(
             eval_env=eval_env,
-            video_folder=f"./videos/{version}_resumed",
+            video_folder=resumed_video_path,
             video_frequency=30_000,
             video_length=1000,
             verbose=1
@@ -805,7 +866,7 @@ if __name__ == "__main__":
         print("🚀 REANUDANDO ENTRENAMIENTO SAC")
         print("="*50)
         print("📊 Monitoreo: tensorboard --logdir=./logs/")
-        print(f"📹 Videos guardados en: ./videos/{version}_resumed/")
+        print(f"📹 Videos guardados en: {resumed_video_path}/")
         print(f"💾 Modelos guardados en: {model_save_path}/")
         print("="*50 + "\n")
         
@@ -845,6 +906,47 @@ if __name__ == "__main__":
         if not os.path.isfile(args.vecnorm):
             parser.error(f"No existe el VecNormalize: {args.vecnorm}")
         set_reproducible_seed(args.seed)
+
+        # Load the checkpoint metadata before constructing the environment.
+        # This lets evaluation recover from the CLI default (V1/12 inputs)
+        # when the selected checkpoint is actually V1.1/10 inputs.
+        model_path = args.evaluate
+        vecnorm_path = args.vecnorm
+        print(f"📦 Cargando checkpoint desde: {model_path}")
+        model = SAC.load(model_path, device="auto")
+
+        model_obs_shape = getattr(model.observation_space, "shape", None)
+        if not model_obs_shape or len(model_obs_shape) != 1:
+            parser.error(
+                "El checkpoint no contiene un espacio de observaciones vectorial compatible"
+            )
+        model_observation_dims = int(model_obs_shape[0])
+
+        version, version_config = resolve_version(args.version)
+        configured_dims = int(version_config["observation_dims"])
+        if configured_dims != model_observation_dims:
+            matching_versions = [
+                candidate
+                for candidate, config in VERSION_CONFIGS.items()
+                if int(config["observation_dims"]) == model_observation_dims
+            ]
+            if len(matching_versions) != 1:
+                parser.error(
+                    "No se puede inferir una versión única para un checkpoint con "
+                    f"{model_observation_dims} observaciones. Coincidencias: "
+                    f"{matching_versions or 'ninguna'}"
+                )
+            inferred_version = matching_versions[0]
+            print(
+                "🔎 Versión ajustada automáticamente: "
+                f"{version} esperaba {configured_dims} observaciones, pero el "
+                f"checkpoint contiene {model_observation_dims}. Usando "
+                f"{inferred_version}."
+            )
+            version, version_config = resolve_version(inferred_version)
+
+        print(f"🧪 Versión de evaluación: {version} ({version_config['description']})")
+        print(f"🔢 Observaciones del checkpoint: {model_observation_dims}")
         print(f"🎓 Curriculum de evaluación: {args.phase}")
         
         print("\n╔════════════════════════════════════════════════╗")
@@ -852,9 +954,7 @@ if __name__ == "__main__":
         print("╚════════════════════════════════════════════════╝\n")
 
         # === Rutas ===
-        model_path = args.evaluate
-        vecnorm_path = args.vecnorm
-        video_folder = "./videos/evaluation/"
+        video_folder = f"./videos/evaluation/{version}/"
         os.makedirs(video_folder, exist_ok=True)
 
         # === Crear entorno ===
@@ -864,7 +964,7 @@ if __name__ == "__main__":
                 task="landing",
                 max_steps=750,
                 render_mode="rgb_array",
-                version=DEFAULT_VERSION,
+                version=version,
                 curriculum_phase=args.phase,
             ))
 
@@ -874,8 +974,28 @@ if __name__ == "__main__":
         eval_env.training = False
         eval_env.norm_reward = False
 
-        # === Cargar modelo ===
-        print(f"📦 Cargando modelo desde: {model_path}")
+        normalizer_mean = getattr(eval_env.obs_rms, "mean", None)
+        normalizer_dims = (
+            int(np.asarray(normalizer_mean).shape[0])
+            if normalizer_mean is not None and np.asarray(normalizer_mean).ndim == 1
+            else None
+        )
+        if normalizer_dims != model_observation_dims:
+            eval_env.close()
+            parser.error(
+                "VecNormalize incompatible: el checkpoint usa "
+                f"{model_observation_dims} observaciones y el normalizador "
+                f"contiene {normalizer_dims}."
+            )
+        print(f"🔢 Observaciones de VecNormalize: {normalizer_dims}")
+
+        # ``model`` was loaded without an environment only to inspect its
+        # observation contract.  It still remembers the six workers used
+        # during training, so BaseAlgorithm.set_env() refuses a one-worker
+        # evaluation environment.  Reloading with ``env=`` is SB3's supported
+        # path for changing n_envs while retaining the trained parameters.
+        del model
+        print("🔄 Recargando modelo para evaluación con 1 entorno...")
         model = SAC.load(model_path, env=eval_env, device="auto")
 
         activation_recorder = None
@@ -1027,4 +1147,8 @@ if __name__ == "__main__":
 
     else:
         # Modo entrenamiento normal
-        model, env = train_starship_sac(seed=args.seed, curriculum_phase=args.phase)
+        model, env = train_starship_sac(
+            seed=args.seed,
+            curriculum_phase=args.phase,
+            version=args.version,
+        )

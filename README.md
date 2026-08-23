@@ -1,4 +1,4 @@
-# Starship V1: terminal landing with reinforcement learning
+# Starship V1/V1.1: terminal landing with reinforcement learning
 
 An educational 2D environment in which a **Soft Actor-Critic (SAC)** agent
 learns the terminal portion of a Starship-inspired landing: belly flop, flip,
@@ -36,7 +36,7 @@ SpaceX.
 | Vehicle height | 50 m |
 | Virtual actuator | One centred, up to 6 MN |
 | Physics timestep | 0.05 s (20 Hz) |
-| Policy observations | 12 |
+| Policy observations | 12 in V1; 10 in V1.1 |
 | Continuous actions | 2 |
 | Episode limit | 750 steps (37.5 s) |
 | Learning algorithm | Soft Actor-Critic |
@@ -92,6 +92,22 @@ must therefore be evaluated or resumed with its associated
 Attitude error and braking margin are engineered observations. V1 is not
 claiming that guidance emerged from entirely raw sensor measurements.
 
+### V1.1 reduced-engineering variant
+
+V1.1 removes the two engineered guidance inputs from the policy:
+
+- phase-dependent attitude error;
+- signed braking margin.
+
+Its 10-value observation contains `x`, AGL, `vx`, `vy`, `sin(theta)`,
+`cos(theta)`, angular rate, current throttle, current gimbal, and remaining
+episode time. Physics, actions, curriculum phases, success conditions, and SAC
+hyperparameters remain identical to V1. V1.1 uses its own reward function,
+described below, so it does not depend on the two removed guidance variables.
+
+V1 and V1.1 checkpoints and `VecNormalize` files are not interchangeable
+because their observation dimensions differ.
+
 ### Actions
 
 The actor emits two continuous commands:
@@ -107,9 +123,8 @@ simulation, the maximum commanded gimbal rate is therefore 20 degrees/s.
 ## Curriculum learning
 
 The complete manoeuvre was too difficult to explore reliably from random SAC
-actions. V1 therefore changes only the initial-state distribution across three
-phases; physics, observations, actions, rewards, and touchdown conditions stay
-the same.
+actions. The curriculum changes only the initial-state distribution across
+three phases and is shared by V1 and V1.1.
 
 Initial states are mirrored around `x = 0`. Horizontal velocity points towards
 the pad and the attitude/angular-rate signs follow the side from which the
@@ -158,6 +173,18 @@ Terminal rewards dominate the shaping terms:
 | Successful landing | `+300` |
 | Crash | `-250` |
 | Timeout | `-200` |
+
+`improved_rewards_v1_1.py` is independent from the V1 reward system. It removes
+the phase-dependent attitude target and the model-based braking envelope. Its
+positive terms reward progress towards the pad, lower lateral speed, becoming
+upright during the terminal approach, and reducing excessive downward speed
+near touchdown. Its penalties use only raw V1.1 quantities: ascent, angular
+rate, uprightness, vertical and lateral speed, pad position, and time.
+
+V1.1 does not prescribe intermediate flip angles or estimate stopping
+distance. Upright guidance begins below 250 m AGL, while speed and pad-control
+penalties become active below 100 m AGL. Terminal rewards remain `+300`,
+`-250`, and `-200`, matching V1.
 
 ## Touchdown and success conditions
 
@@ -241,10 +268,16 @@ Python version, GPU, and NVIDIA driver using the official
 
 ## Training
 
-Start Phase 1 from scratch:
+Start V1 Phase 1 from scratch:
 
 ```powershell
-python main.py --phase phase_1 --seed 42
+python main.py --version v1 --phase phase_1 --seed 42
+```
+
+Start V1.1 with the same curriculum conditions:
+
+```powershell
+python main.py --version v1_1 --phase phase_1 --seed 42
 ```
 
 Fresh training currently runs for four million environment timesteps with six
@@ -272,6 +305,7 @@ Resume the Phase 1 policy in Phase 2:
 
 ```powershell
 python main.py `
+  --version v1 `
   --resume .\models\v1_single_engine\final_model.zip `
   --vecnorm .\models\v1_single_engine\vec_normalize.pkl `
   --phase phase_2 `
@@ -297,6 +331,7 @@ Evaluate a model against a selected phase without training:
 
 ```powershell
 python main.py `
+  --version v1 `
   --evaluate .\models\v1_single_engine\final_model.zip `
   --vecnorm .\models\v1_single_engine\vec_normalize.pkl `
   --phase phase_1 `
@@ -312,12 +347,27 @@ the base seed or increase `--episodes` to test a different sample.
 Evaluation exports one MP4 per episode under `videos/evaluation/` and prints
 success, crash, timeout, reward, final altitude, and velocity summaries.
 
+## Curriculum evaluation chart
+
+Generate the Plotly comparison of V1 Phase 1-3 evaluation reward and episode
+length from the existing TensorBoard event files:
+
+```powershell
+python plot_v1_curriculum_evaluations.py
+```
+
+The command writes a LinkedIn-ready PNG, an interactive self-contained HTML
+chart, and the extracted evaluation values as CSV under `gallery/`. The plot
+uses the original global timestep values and does not smooth or interpolate
+the evaluation checkpoints.
+
 ## Neural activation visualisation
 
 Add `--activation-visualization` to evaluation:
 
 ```powershell
 python main.py `
+  --version v1 `
   --evaluate .\models\v1_single_engine\final_model.zip `
   --vecnorm .\models\v1_single_engine\vec_normalize.pkl `
   --phase phase_1 `
@@ -332,7 +382,8 @@ For every episode this additionally creates:
 - `episode_NN_combined.mp4`: synchronised simulation and network views.
 
 The visualiser shows a representative subset of hidden neurons; it does not
-change the policy or the inference result.
+change the policy or the inference result. Input labels are selected
+automatically for the 12-input V1 actor or the 10-input V1.1 actor.
 
 Combine all activation videos and optionally accelerate them:
 
@@ -363,10 +414,11 @@ python combine_evaluation_episodes.py `
 main.py                         Gymnasium wrapper, SAC setup, callbacks, and CLI
 rocket.py                       Dynamics, contact, success logic, and rendering
 improved_rewards_v1.py          V1 progress-based reward system
+improved_rewards_v1_1.py        Isolated V1.1 reward class
 curriculum_phases.py            Initial-state distributions for Phases 1-3
 activation_visualizer.py        Actor activation GIF and combined-video export
 combine_evaluation_episodes.py  Concatenate and accelerate evaluation media
-policy.py                       Recovered policy utilities
+plot_v1_curriculum_evaluations.py  Plot Phase 1-3 TensorBoard evaluations
 utils.py                        Recovered project utilities
 Requirements.txt                Python dependencies
 ```
@@ -383,21 +435,3 @@ videos are ignored by Git.
 3. **V3:** fuel, variable mass, failures, and propellant-margin management.
 4. **V4:** flaps, wind, weather, uncertainty, and domain randomisation.
 5. **V5:** a higher-altitude glide and transition into the terminal manoeuvre.
-
-## Licence and citation
-
-Zhengxia Zou's original project is released under
-[CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/). This
-educational derivative retains attribution, the non-commercial condition, and
-the same licence for derivative works. Refer to the original repository for
-the complete licence text and attribution.
-
-```bibtex
-@misc{zou2021rocket,
-  author = {Zhengxia Zou},
-  title = {Rocket-recycling with Reinforcement Learning},
-  year = {2021},
-  publisher = {GitHub},
-  howpublished = {\url{https://github.com/jiupinjia/rocket-recycling}}
-}
-```

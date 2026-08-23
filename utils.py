@@ -1,5 +1,6 @@
 import numpy as np
 import cv2
+from pathlib import Path
 
 ################ Some helper functions... ####################
 
@@ -16,7 +17,19 @@ def moving_avg(x, N=500):
 
 
 def load_bg_img(path_to_img, w, h):
-    bg_img = cv2.imread(path_to_img, cv2.IMREAD_COLOR)
+    bg_img = (
+        cv2.imread(str(path_to_img), cv2.IMREAD_COLOR)
+        if Path(path_to_img).is_file()
+        else None
+    )
+    if bg_img is None:
+        # Background artwork is optional and intentionally excluded from Git.
+        # A generated sky keeps fresh clones and headless training functional.
+        top_rgb = np.array([10, 24, 45], dtype=np.float32)
+        bottom_rgb = np.array([150, 185, 215], dtype=np.float32)
+        blend = np.linspace(0.0, 1.0, int(h), dtype=np.float32)[:, None]
+        rows = top_rgb[None, :] * (1.0 - blend) + bottom_rgb[None, :] * blend
+        return np.repeat(rows[:, None, :], int(w), axis=1).astype(np.uint8)
     bg_img = cv2.cvtColor(bg_img, cv2.COLOR_BGR2RGB)
     bg_img = cv2.resize(bg_img, (w, h))
     return bg_img

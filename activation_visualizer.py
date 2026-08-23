@@ -16,7 +16,7 @@ import numpy as np
 import torch
 
 
-INPUT_LABELS = (
+V1_INPUT_LABELS = (
     "x",
     "AGL",
     "vx",
@@ -30,6 +30,33 @@ INPUT_LABELS = (
     "braking margin",
     "time remaining",
 )
+
+V1_1_INPUT_LABELS = (
+    "x",
+    "AGL",
+    "vx",
+    "vy",
+    "sin(theta)",
+    "cos(theta)",
+    "angular rate",
+    "previous throttle",
+    "previous gimbal",
+    "time remaining",
+)
+
+
+def _input_labels(observation_dims):
+    labels_by_dimension = {
+        len(V1_INPUT_LABELS): V1_INPUT_LABELS,
+        len(V1_1_INPUT_LABELS): V1_1_INPUT_LABELS,
+    }
+    try:
+        return labels_by_dimension[int(observation_dims)]
+    except KeyError as exc:
+        raise ValueError(
+            "No hay etiquetas de visualizacion para un vector de "
+            f"{observation_dims} observaciones."
+        ) from exc
 
 
 @dataclass
@@ -196,6 +223,7 @@ def _prepare_episode(samples, actor, shown_neurons):
     )
 
     return {
+        "input_labels": _input_labels(observations.shape[1]),
         "observations": observations,
         "actions": actions,
         "hidden_1": hidden_1,
@@ -219,7 +247,8 @@ def _render_network_frame(sample, prepared, frame_index, phase, status,
     canvas = np.full((height, width, 3), 248, dtype=np.uint8)
     cv2.rectangle(canvas, (12, 12), (width - 13, height - 13), (205, 213, 224), 1)
 
-    input_positions = _positions(245, len(INPUT_LABELS), 80, 635)
+    input_labels = prepared["input_labels"]
+    input_positions = _positions(245, len(input_labels), 80, 635)
     h1_positions = _positions(520, len(prepared["h1_indices"]), 105, 610)
     h2_positions = _positions(795, len(prepared["h2_indices"]), 105, 610)
     output_positions = [(1045, 270), (1045, 450)]
@@ -243,7 +272,7 @@ def _render_network_frame(sample, prepared, frame_index, phase, status,
     )
 
     for index, (label, position, value) in enumerate(
-        zip(INPUT_LABELS, input_positions, observation)
+        zip(input_labels, input_positions, observation)
     ):
         color = (75, 145, 222) if value >= 0.0 else (245, 132, 31)
         _draw_node(canvas, position, value, prepared["input_scale"], color, 14)

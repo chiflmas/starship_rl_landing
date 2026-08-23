@@ -29,9 +29,24 @@ CURRICULUM_PHASES = {
         "vy_mps": (-40.0, -25.0),
         "abs_theta_deg": (15.0, 30.0),
         "theta_noise_deg": (0.0, 0.0),
-        # El signo se aplica en rocket.py para que coincida con el sentido
-        # del flip: positivo desde x>0 y negativo desde x<0.
+        # El signo se aplica en rocket.py en oposicion a theta para representar
+        # un flip que ya progresa desde belly-flop hacia la vertical.
         "abs_vtheta_deg_s": (0.0, 4.0),
+    },
+    "phase_2_5": {
+        "description": "Puente hacia belly-flop completo con dificultad solapada.",
+        "altitude_agl_m": (300.0, 480.0),
+        "abs_x_m": (45.0, 130.0),
+        # Mantiene continuidad con phase 2 y se aproxima a los 9 m/s minimos
+        # de phase 3 conforme aumenta el offset horizontal.
+        "inward_vx_mps": (4.0, 9.0),
+        "inward_vx_linear_with_abs_x": True,
+        "vy_mps": (-70.0, -35.0),
+        "abs_theta_deg": (25.0, 65.0),
+        "theta_noise_deg": (0.0, 0.0),
+        # rocket.py aplica el signo opuesto a theta para continuar el flip
+        # hacia la vertical desde cualquiera de los dos lados.
+        "abs_vtheta_deg_s": (0.0, 5.0),
     },
     "phase_3": {
         "description": "Escenario V1 completo anterior al curriculum.",

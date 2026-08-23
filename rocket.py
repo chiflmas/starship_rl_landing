@@ -266,11 +266,25 @@ class Rocket(object):
 
     def __init__(self, max_steps, task='hover', rocket_type='falcon',
                  viewport_h=900, path_to_bg_img=None, engine_mode='three',
-                 curriculum_phase=DEFAULT_CURRICULUM_PHASE):
+                 curriculum_phase=DEFAULT_CURRICULUM_PHASE,
+                 observation_mode=None):
 
         self.task = task
         self.rocket_type = rocket_type
         self.engine_mode = engine_mode
+        self.observation_mode = observation_mode or (
+            'v1_engineered' if engine_mode == 'single' else 'legacy'
+        )
+        valid_observation_modes = {'v1_engineered', 'v1_raw', 'legacy'}
+        if self.observation_mode not in valid_observation_modes:
+            raise ValueError(
+                f"Unknown observation mode {self.observation_mode!r}. "
+                f"Available: {sorted(valid_observation_modes)}"
+            )
+        if self.engine_mode == 'single' and self.observation_mode == 'legacy':
+            raise ValueError("Single-engine environments require a V1 observation mode")
+        if self.engine_mode != 'single' and self.observation_mode != 'legacy':
+            raise ValueError("Three-engine environments require legacy observations")
         self.curriculum_phase_name = curriculum_phase
         self.curriculum_phase = get_curriculum_phase(curriculum_phase)
         self.debug_mode = False
@@ -354,9 +368,14 @@ class Rocket(object):
         self.state = self.create_random_state()
         self.action_table = self.create_action_table()
 
-        # V1 exposes only physically useful state. Legacy keeps its original
-        # 23-dimensional observation for checkpoint compatibility.
-        self.state_dims = 12 if self.engine_mode == 'single' else 23
+        # Observation dimensions are explicit so a new version cannot silently
+        # load a checkpoint trained with a different input contract.
+        observation_dims = {
+            'v1_engineered': 12,
+            'v1_raw': 10,
+            'legacy': 23,
+        }
+        self.state_dims = observation_dims[self.observation_mode]
 
         if self.rocket_type == 'starship':
             # Espacio continuo: [t0, t1, t2, v0, v1, v2]
@@ -658,11 +677,15 @@ class Rocket(object):
         theta_deg += np.random.uniform(*phase['theta_noise_deg'])
         theta = side * np.deg2rad(theta_deg)
         vtheta_magnitude = random.uniform(*phase['abs_vtheta_deg_s'])
-        vtheta = side * np.deg2rad(vtheta_magnitude)
+        # The curriculum represents a flip already progressing from the
+        # belly-flop attitude towards upright (theta=0).  Its angular velocity
+        # must therefore oppose the current attitude sign.  Using the same
+        # sign made both mirrored spawns initially rotate towards +/-180 deg.
+        vtheta = -side * np.deg2rad(vtheta_magnitude)
 
         assert x * vx <= 1e-6, "vx no apunta hacia el centro"
         assert x * theta >= -1e-6, "theta no inclina hacia el centro"
-        assert x * vtheta >= -1e-6, "vtheta no coincide con el sentido del flip"
+        assert theta * vtheta <= 1e-6, "vtheta no reduce el angulo del flip"
 
         return {
             'x': x, 'y': y,
@@ -1810,6 +1833,13 @@ class Rocket(object):
         vx_new, vy_new = vx + ax*self.dt, vy + ay*self.dt
         theta_new = theta + vtheta*self.dt + 0.5*atheta*(self.dt**2)
         vtheta_new = vtheta + atheta*self.dt
+
+        # V1 uses a physical orientation, not an accumulated revolution
+        # counter.  Keeping it in [-pi, pi] makes the trigonometric
+        # observation and the terminal attitude checks describe the same
+        # orientation.  Legacy remains untouched for checkpoint compatibility.
+        if self.engine_mode == 'single':
+            theta_new = np.arctan2(np.sin(theta_new), np.cos(theta_new))
     
         # ══════════════════════════════════════════════════════════════
         # 🔥 NUEVO: Detección de impacto y guardado de velocidad
@@ -1952,8 +1982,39 @@ class Rocket(object):
     #         state['phi']]
     #     return np.array(x, dtype=np.float32)/100.  # Asegurar dtype
 
+    def _v1_physical_observation(self, state):
+        """Return the nine directly measurable state and actuator values."""
+        altitude = max(0.0, float(state['y']) - self.H / 2.0)
+        theta = float(state['theta'])
+        current_throttle = float(np.clip(
+            sum(getattr(self, 'engines_thrust', [0.0]))
+            / max(self.engine_thrust_sl, 1.0),
+            0.0,
+            1.0,
+        ))
+        current_gimbal = float(getattr(self, 'engine_gimbals', [0.0])[0])
+
+        return [
+            np.clip(float(state['x']) / 200.0, -2.0, 2.0),
+            np.clip(altitude / 600.0, 0.0, 2.0),
+            np.clip(float(state['vx']) / 50.0, -2.0, 2.0),
+            np.clip(float(state['vy']) / 100.0, -2.0, 2.0),
+            np.sin(theta),
+            np.cos(theta),
+            np.clip(float(state['vtheta']), -2.0, 2.0),
+            current_throttle,
+            np.clip(current_gimbal / np.deg2rad(30.0), -1.0, 1.0),
+        ]
+
+    def _remaining_episode_fraction(self, state):
+        return np.clip(
+            1.0 - float(state['t']) / self.max_steps,
+            0.0,
+            1.0,
+        )
+
     def _flatten_v1(self, state):
-        """Return the compact, Markov observation used only by V1."""
+        """Return V1's 12 values, including two engineered guidance inputs."""
         altitude = max(0.0, float(state['y']) - self.H / 2.0)
         theta = float(state['theta'])
 
@@ -1985,27 +2046,17 @@ class Rocket(object):
             (downward_speed ** 2 - 5.5 ** 2) / (2.0 * 20.0),
         )
         braking_margin = altitude - stopping_distance - 40.0
-        current_throttle = float(np.clip(
-            sum(getattr(self, 'engines_thrust', [0.0]))
-            / max(self.engine_thrust_sl, 1.0),
-            0.0,
-            1.0,
-        ))
-        current_gimbal = float(getattr(self, 'engine_gimbals', [0.0])[0])
-
-        observation = [
-            np.clip(float(state['x']) / 200.0, -2.0, 2.0),
-            np.clip(altitude / 600.0, 0.0, 2.0),
-            np.clip(float(state['vx']) / 50.0, -2.0, 2.0),
-            np.clip(float(state['vy']) / 100.0, -2.0, 2.0),
-            np.sin(theta),
-            np.cos(theta),
-            np.clip(float(state['vtheta']), -2.0, 2.0),
-            current_throttle,
-            np.clip(current_gimbal / np.deg2rad(30.0), -1.0, 1.0),
+        observation = self._v1_physical_observation(state) + [
             np.clip(attitude_error / np.pi, -1.0, 1.0),
             np.clip(braking_margin / 100.0, -2.0, 2.0),
-            np.clip(1.0 - float(state['t']) / self.max_steps, 0.0, 1.0),
+            self._remaining_episode_fraction(state),
+        ]
+        return np.asarray(observation, dtype=np.float32)
+
+    def _flatten_v1_1(self, state):
+        """Return V1.1's 10 values without engineered guidance inputs."""
+        observation = self._v1_physical_observation(state) + [
+            self._remaining_episode_fraction(state),
         ]
         return np.asarray(observation, dtype=np.float32)
 
@@ -2018,8 +2069,10 @@ class Rocket(object):
         - Información de configuración de motores
         - Flags de compensación y zona crítica
         """
-        if self.engine_mode == 'single':
+        if self.observation_mode == 'v1_engineered':
             return self._flatten_v1(state)
+        if self.observation_mode == 'v1_raw':
+            return self._flatten_v1_1(state)
 
         # Legacy three-engine observation starts here and remains unchanged.
 
