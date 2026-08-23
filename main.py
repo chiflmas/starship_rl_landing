@@ -485,7 +485,7 @@ def train_starship_sac(load=False, seed=42,
     task = 'landing'
     version, version_config = resolve_version(version)
     output_name = version_config['output_name']
-    total_timesteps = 4_000_000
+    total_timesteps = 1_000_000
     n_envs = 6
     model_save_path = f"./models/{output_name}"
     log_path = f"./logs/{output_name}/"
@@ -719,8 +719,6 @@ if __name__ == "__main__":
                         help="Episodios deterministas al usar --evaluate (por defecto: 10)")
     parser.add_argument("--learning-rate", type=float, default=1e-4,
                         help="Learning rate de fine-tuning al usar --resume (por defecto: 1e-4)")
-    parser.add_argument("--warmup-steps", type=int, default=50_000,
-                        help="Transiciones nuevas antes de actualizar SAC al usar --resume (por defecto: 50000)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Semilla base para entornos, NumPy, Python y Torch (por defecto: 42)")
     parser.add_argument(
@@ -822,13 +820,8 @@ if __name__ == "__main__":
         # SAC.save() no incluye el replay buffer. Antes de entrenar de nuevo,
         # llenamos un buffer nuevo con experiencias de la física/rewards
         # actuales; num_timesteps se conserva para no reiniciar los logs.
-        if args.warmup_steps < 0:
-            parser.error("--warmup-steps debe ser mayor o igual que 0")
-        model.learning_starts = model.num_timesteps + args.warmup_steps
-        print(
-            f"🧠 Warm-up de replay buffer: {args.warmup_steps:,} "
-            "transiciones nuevas antes de actualizar la red"
-        )
+        model.learning_starts = model.num_timesteps + 50_000
+        print("🧠 Warm-up de replay buffer: 50,000 transiciones nuevas antes de actualizar la red")
         print(f"🔢 Timesteps previos: {model.num_timesteps:,}")
         
         # Configurar callbacks (IDÉNTICOS al original)
@@ -906,47 +899,8 @@ if __name__ == "__main__":
         if not os.path.isfile(args.vecnorm):
             parser.error(f"No existe el VecNormalize: {args.vecnorm}")
         set_reproducible_seed(args.seed)
-
-        # Load the checkpoint metadata before constructing the environment.
-        # This lets evaluation recover from the CLI default (V1/12 inputs)
-        # when the selected checkpoint is actually V1.1/10 inputs.
-        model_path = args.evaluate
-        vecnorm_path = args.vecnorm
-        print(f"📦 Cargando checkpoint desde: {model_path}")
-        model = SAC.load(model_path, device="auto")
-
-        model_obs_shape = getattr(model.observation_space, "shape", None)
-        if not model_obs_shape or len(model_obs_shape) != 1:
-            parser.error(
-                "El checkpoint no contiene un espacio de observaciones vectorial compatible"
-            )
-        model_observation_dims = int(model_obs_shape[0])
-
         version, version_config = resolve_version(args.version)
-        configured_dims = int(version_config["observation_dims"])
-        if configured_dims != model_observation_dims:
-            matching_versions = [
-                candidate
-                for candidate, config in VERSION_CONFIGS.items()
-                if int(config["observation_dims"]) == model_observation_dims
-            ]
-            if len(matching_versions) != 1:
-                parser.error(
-                    "No se puede inferir una versión única para un checkpoint con "
-                    f"{model_observation_dims} observaciones. Coincidencias: "
-                    f"{matching_versions or 'ninguna'}"
-                )
-            inferred_version = matching_versions[0]
-            print(
-                "🔎 Versión ajustada automáticamente: "
-                f"{version} esperaba {configured_dims} observaciones, pero el "
-                f"checkpoint contiene {model_observation_dims}. Usando "
-                f"{inferred_version}."
-            )
-            version, version_config = resolve_version(inferred_version)
-
         print(f"🧪 Versión de evaluación: {version} ({version_config['description']})")
-        print(f"🔢 Observaciones del checkpoint: {model_observation_dims}")
         print(f"🎓 Curriculum de evaluación: {args.phase}")
         
         print("\n╔════════════════════════════════════════════════╗")
@@ -954,6 +908,8 @@ if __name__ == "__main__":
         print("╚════════════════════════════════════════════════╝\n")
 
         # === Rutas ===
+        model_path = args.evaluate
+        vecnorm_path = args.vecnorm
         video_folder = f"./videos/evaluation/{version}/"
         os.makedirs(video_folder, exist_ok=True)
 
@@ -974,28 +930,8 @@ if __name__ == "__main__":
         eval_env.training = False
         eval_env.norm_reward = False
 
-        normalizer_mean = getattr(eval_env.obs_rms, "mean", None)
-        normalizer_dims = (
-            int(np.asarray(normalizer_mean).shape[0])
-            if normalizer_mean is not None and np.asarray(normalizer_mean).ndim == 1
-            else None
-        )
-        if normalizer_dims != model_observation_dims:
-            eval_env.close()
-            parser.error(
-                "VecNormalize incompatible: el checkpoint usa "
-                f"{model_observation_dims} observaciones y el normalizador "
-                f"contiene {normalizer_dims}."
-            )
-        print(f"🔢 Observaciones de VecNormalize: {normalizer_dims}")
-
-        # ``model`` was loaded without an environment only to inspect its
-        # observation contract.  It still remembers the six workers used
-        # during training, so BaseAlgorithm.set_env() refuses a one-worker
-        # evaluation environment.  Reloading with ``env=`` is SB3's supported
-        # path for changing n_envs while retaining the trained parameters.
-        del model
-        print("🔄 Recargando modelo para evaluación con 1 entorno...")
+        # === Cargar modelo ===
+        print(f"📦 Cargando modelo desde: {model_path}")
         model = SAC.load(model_path, env=eval_env, device="auto")
 
         activation_recorder = None
