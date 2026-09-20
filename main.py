@@ -2,8 +2,15 @@ import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 from stable_baselines3 import SAC
+from policy_warmup_sac import PolicyWarmupSAC
 from stable_baselines3.common.env_util import make_vec_env
-from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize, VecVideoRecorder
+from stable_baselines3.common.vec_env import (
+    DummyVecEnv,
+    SubprocVecEnv,
+    VecNormalize,
+    VecVideoRecorder,
+    sync_envs_normalization,
+)
 from stable_baselines3.common.callbacks import EvalCallback, EveryNTimesteps, BaseCallback
 from stable_baselines3.common.monitor import Monitor
 import torch
@@ -15,6 +22,7 @@ import os
 import sys
 from importlib import import_module
 from collections import defaultdict
+from checkpointing import CheckpointStore, LandingEvalCallback, PeriodicCheckpointCallback
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
@@ -36,6 +44,15 @@ VERSION_CONFIGS = {
         "reward_module": "improved_rewards_v1_1",
         "reward_class": "V11SingleEngineRewardSystem",
         "output_name": "v1_1_single_engine",
+    },
+    "v2": {
+        "description": "Three engines, 17 compact observations, and 9 actions",
+        "engine_mode": "three_v2",
+        "observation_mode": "v2_raw",
+        "observation_dims": 17,
+        "reward_module": "improved_rewards_v2",
+        "reward_class": "V2ThreeEngineRewardSystem",
+        "output_name": "v2_three_engine_compact17",
     },
     "legacy_three_engine": {
         "description": "Recovered three-engine environment",
@@ -89,12 +106,14 @@ def set_reproducible_seed(seed):
 class StarshipGymEnv(gym.Env):
     def __init__(self, task='landing', max_steps=750, render_mode=None,
                  version=DEFAULT_VERSION,
-                 curriculum_phase=DEFAULT_CURRICULUM_PHASE):
+                 curriculum_phase=DEFAULT_CURRICULUM_PHASE,
+                 render_layout='default'):
         super().__init__()
         
         self.version, self.version_config = resolve_version(version)
         self.engine_mode = self.version_config['engine_mode']
         self.render_mode = render_mode
+        self.render_layout = render_layout
         self.curriculum_phase = curriculum_phase
         self.rocket_env = Rocket(
             task=task,
@@ -129,6 +148,18 @@ class StarshipGymEnv(gym.Env):
             self.action_space = spaces.Box(
                 low=np.array([0.0, -1.0], dtype=np.float32),
                 high=np.array([1.0, 1.0], dtype=np.float32),
+                dtype=np.float32,
+            )
+        elif self.engine_mode == 'three_v2':
+            # V2 separates throttle, gimbal, and ON/OFF for each engine. This
+            # removes the discontinuity that previously placed minimum thrust
+            # next to the shutdown boundary in the same action component.
+            self.action_space = spaces.Box(
+                low=np.array(
+                    [0.0, 0.0, 0.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0],
+                    dtype=np.float32,
+                ),
+                high=np.ones(9, dtype=np.float32),
                 dtype=np.float32,
             )
         else:
@@ -192,8 +223,16 @@ class StarshipGymEnv(gym.Env):
                     thrust / self.rocket_env.engine_thrust_sl
                 )
         
-        terminated = bool(done)
-        truncated = bool(self.current_step >= self.max_steps)
+        reached_time_limit = self.current_step >= self.max_steps
+        if self.version == "v2" and reached_time_limit:
+            # En V2 agotar los 750 pasos es un fallo de la tarea, no una
+            # truncacion externa. Marcarlo como terminal evita que SAC haga
+            # bootstrap mas alla del timeout pese a haber recibido su coste.
+            terminated = True
+            truncated = False
+        else:
+            terminated = bool(done)
+            truncated = bool(reached_time_limit and not terminated)
         
         if terminated or truncated:
             self.episode_stats['final_altitude'] = altitude
@@ -217,8 +256,20 @@ class StarshipGymEnv(gym.Env):
             )
             self.episode_stats['required_steps'] = required_steps
             self.episode_stats['success'] = bool(self.rocket_env.already_landing)
+            if self.episode_stats['success']:
+                self.episode_stats['termination_reason'] = 'landing'
+            elif reached_time_limit:
+                self.episode_stats['termination_reason'] = 'timeout'
+            elif self.rocket_env.already_crash:
+                self.episode_stats['termination_reason'] = info.get(
+                    'termination_reason', 'crash'
+                )
+            else:
+                self.episode_stats['termination_reason'] = 'truncated'
 
             info['episode_stats'] = self.episode_stats
+            # EvalCallback reconoce esta clave y registra success_rate.
+            info['is_success'] = self.episode_stats['success']
         
         return np.array(next_state, dtype=np.float32), reward, terminated, truncated, info or {}
     
@@ -238,20 +289,26 @@ class StarshipGymEnv(gym.Env):
         action[0:3]  → throttles (rango [0, 1])
         action[3:6]  → gimbals (rango [-1, 1])
         action[6:9]  → on/off (rango [-1, 1])
+
+        V2 mantiene throttle, gimbal y ON/OFF separados. El mapeo lineal
+        30-100 % se aplica después en Rocket.step(). Un motor que ya estuvo
+        encendido queda bloqueado definitivamente cuando recibe OFF.
         
-        MAPEO DE THROTTLES:
+        MAPEO DE THROTTLES V2:
         - Red produce: [0.0, 1.0]
-        - Se mapea linealmente a: [0.4, 1.0] (rango físico Raptor)
-        - Fórmula: physical_throttle = 0.4 + 0.6 * network_output
-        - Ventaja: Sin zona muerta, todo el rango es útil
+        - Rocket.step() lo mapea linealmente a: [0.30, 1.0]
+        - Fórmula: physical_throttle = 0.30 + 0.70 * network_output
+        - El primer step de cada encendido queda limitado al 30 %
         
         MAPEO ON/OFF:
-        - on_signal > 0  → Motor ENCENDIDO (usa throttle mapeado)
-        - on_signal ≤ 0  → Motor APAGADO (empuje = 0, ignora throttle)
+        - on_signal >= +0.20 → encender/continuar si sigue disponible
+        - on_signal <= 0.0 → apagar; si estaba ON queda bloqueado
+        - 0.0 < on_signal < +0.20 → conservar el estado anterior
         
         APRENDIZAJE:
-        - Para empuje 0%: Debe aprender on_signal ≤ 0 (NO throttle=0)
-        - Para empuje 40-100%: Debe aprender on_signal > 0 + throttle [0,1]
+        - Para encender: Debe aprender on_signal >= +0.20 + throttle [0,1]
+        - Para apagar: Debe aprender on_signal <= 0.0 (NO throttle=0)
+        - Tras apagar un motor que estaba ON, no puede volver a encenderlo
         """
         if self.engine_mode == 'single':
             # SAC starts near the centre of a Box action and samples uniformly
@@ -263,6 +320,15 @@ class StarshipGymEnv(gym.Env):
             throttle = throttle_command ** 3
             gimbal = float(np.clip(action[1], -1.0, 1.0)) * np.deg2rad(30.0)
             return np.array([throttle, gimbal], dtype=np.float32)
+
+        if self.engine_mode == 'three_v2':
+            converted = np.zeros(9, dtype=np.float32)
+            converted[0:3] = np.clip(action[0:3], 0.0, 1.0)
+            # Keep V2 gimbals normalized here. Rocket.step() owns the single
+            # normalized-command -> physical-angle conversion.
+            converted[3:6] = np.clip(action[3:6], -1.0, 1.0)
+            converted[6:9] = np.clip(action[6:9], -1.0, 1.0)
+            return converted
 
         converted = np.zeros(9, dtype=np.float32)
         
@@ -286,9 +352,15 @@ class StarshipGymEnv(gym.Env):
         if mode is None:
             mode = self.render_mode
         if mode == 'rgb_array':
-            return self.rocket_env.render(return_rgb_array=True)
+            return self.rocket_env.render(
+                return_rgb_array=True,
+                render_layout=self.render_layout,
+            )
         else:
-            return self.rocket_env.render(return_rgb_array=False)
+            return self.rocket_env.render(
+                return_rgb_array=False,
+                render_layout=self.render_layout,
+            )
     
     def close(self):
         if hasattr(self.rocket_env, 'close'):
@@ -363,6 +435,8 @@ class SACProgressCallback(BaseCallback):
         self.episode_lengths = []
         self.landing_successes = []
         self.min_altitudes = []
+        self.max_throttles = []
+        self.termination_reasons = []
         
     def _on_step(self) -> bool:
         # Recopilar información de episodios terminados
@@ -373,6 +447,10 @@ class SACProgressCallback(BaseCallback):
                 stats = info["episode_stats"]
                 self.episode_rewards.append(stats['total_reward'])
                 self.min_altitudes.append(stats['min_altitude'])
+                self.max_throttles.append(stats.get('max_throttle', 0.0))
+                self.termination_reasons.append(
+                    stats.get('termination_reason', 'unknown')
+                )
                 
                 # Usar la decisión terminal del entorno, no una reconstrucción
                 # aproximada a partir del estado final.
@@ -396,6 +474,8 @@ class SACProgressCallback(BaseCallback):
                     recent_rewards = self.episode_rewards[-50:]
                     recent_successes = self.landing_successes[-50:]
                     recent_altitudes = self.min_altitudes[-50:]
+                    recent_throttles = self.max_throttles[-50:]
+                    recent_reasons = self.termination_reasons[-50:]
                     
                     if self.verbose:
                         print(f"\n[SAC Progress] Episodes: {len(self.episode_rewards)}")
@@ -403,7 +483,12 @@ class SACProgressCallback(BaseCallback):
                         print(f"  Success Rate: {np.mean(recent_successes)*100:.1f}%")
                         print(f"  Avg Min Altitude: {np.mean(recent_altitudes):.1f}m")
                         print(f"  Engines Used: {stats.get('engines_used', 'N/A')}")
-                        print(f"  Max Throttle: {stats.get('max_throttle', 0)*100:.1f}%")
+                        print(f"  Avg Episode Max Throttle: {np.mean(recent_throttles)*100:.1f}%")
+                        reason_counts = {
+                            reason: recent_reasons.count(reason)
+                            for reason in sorted(set(recent_reasons))
+                        }
+                        print(f"  Terminations: {reason_counts}")
 
                         # 🔥 NUEVO: Info de estabilización
                         if 'stable_steps' in stats:
@@ -432,7 +517,12 @@ class SACProgressCallback(BaseCallback):
 # MODELO SAC OPTIMIZADO
 # ═══════════════════════════════════════════════════════════════
 
-def create_optimized_sac_model(env, log_path="./logs/"):
+def create_optimized_sac_model(
+    env,
+    log_path="./logs/",
+    version=DEFAULT_VERSION,
+    curriculum_phase=DEFAULT_CURRICULUM_PHASE,
+):
     # policy_kwargs = dict(
     #     net_arch=dict(pi=[768, 768, 384], qf=[768, 768, 384]),
     #     activation_fn=torch.nn.ReLU,
@@ -441,26 +531,40 @@ def create_optimized_sac_model(env, log_path="./logs/"):
     # )
 
     policy_kwargs = dict(
-        net_arch=dict(pi=[256, 256],
+        net_arch=dict(pi=[128, 128],
                       qf=[256, 256, 256]),
         activation_fn=torch.nn.ReLU,
         n_critics=2,
     )
 
+    # SB3 sums log-probabilities over all nine V2 outputs, including masked
+    # actuators. Use the same automatic entropy target across V2 phases.
+    is_v2 = version == "v2"
+    if is_v2:
+        ent_coef = "auto_0.01"
+        target_entropy = -9.0
+    else:
+        ent_coef = "auto_0.1"
+        target_entropy = "auto"
+
+    learning_rate = 3e-4 if is_v2 else 3e-4
+    gamma = 0.999 if is_v2 else 0.998
+    gradient_steps = 4
+
     model = SAC(
         "MlpPolicy",
         env,
-        learning_rate=3e-4,          # Estable
-        buffer_size=400_000,       # Amplio pero no excesivo
-        learning_starts=20_000,      # Aprender pronto
-        batch_size=512,             # Buen tamaño para GPU
-        gamma=0.998,                 
+        learning_rate=learning_rate,
+        buffer_size=600_000,       # Amplio pero no excesivo
+        learning_starts=30_000,      # Aprender pronto
+        batch_size=1024,             # Buen tamaño para GPU
+        gamma=gamma,
         tau=0.005,                   # Target más suave (stabiliza critic)
         train_freq=(1, "step"),                # 🔥 Clave: mantiene ritmo estable
-        gradient_steps=3,
+        gradient_steps=gradient_steps,
         target_update_interval=1,
-        ent_coef="auto_0.1",        # Exploración moderada
-        target_entropy="auto",
+        ent_coef=ent_coef,
+        target_entropy=target_entropy,
         use_sde=False,
         policy_kwargs=policy_kwargs,
         tensorboard_log=log_path,
@@ -477,7 +581,8 @@ def create_optimized_sac_model(env, log_path="./logs/"):
 
 def train_starship_sac(load=False, seed=42,
                        curriculum_phase=DEFAULT_CURRICULUM_PHASE,
-                       version=DEFAULT_VERSION):
+                       version=DEFAULT_VERSION,
+                       render_layout='default'):
     """
     Entrena Starship con SAC optimizado para aterrizaje
     """
@@ -485,8 +590,10 @@ def train_starship_sac(load=False, seed=42,
     task = 'landing'
     version, version_config = resolve_version(version)
     output_name = version_config['output_name']
-    total_timesteps = 1_000_000
-    n_envs = 6
+    if version == "v2":
+        output_name = f"{output_name}_{curriculum_phase}"
+    total_timesteps = 4_000_000
+    n_envs = 8
     model_save_path = f"./models/{output_name}"
     log_path = f"./logs/{output_name}/"
     video_path = f"./videos/{output_name}"
@@ -502,55 +609,85 @@ def train_starship_sac(load=False, seed=42,
     print(f"   • Curriculum: {curriculum_phase}")
     print(f"   • Total timesteps: {total_timesteps:,}")
     print(f"   • Buffer size: 400_000")
-    print(f"   • Batch size: 512")
+    print(f"   • Batch size: 1024")
     print(f"   • Learning starts: 20k")
-    print(f"   • Entropy: auto_0.1")
+    if version == "v2":
+        print("   • Learning rate: 1e-4")
+        print("   • Gamma: 0.999")
+        print("   • Gradient steps: 4")
+        print("   • Observation normalization: VecNormalize")
+    else:
+        print("   • Learning rate: 3e-4")
+        print("   • Gamma: 0.998")
+        print("   • Gradient steps: 4")
+        print("   • Observation normalization: VecNormalize")
+    if version == "v2":
+        entropy_description = "auto_0.01, target -9.0"
+    else:
+        entropy_description = "auto_0.1"
+    print(f"   • Entropy: {entropy_description}")
     print()
     
     # Crear directorios
     os.makedirs(model_save_path, exist_ok=True)
     os.makedirs(log_path, exist_ok=True)
     os.makedirs(video_path, exist_ok=True)
+
+    checkpoint_store = CheckpointStore(model_save_path, version, curriculum_phase, seed)
+    log_path = os.path.join(log_path, checkpoint_store.path.name)
+    os.makedirs(log_path, exist_ok=True)
+    print(f"[Logs] TensorBoard and evaluations: {log_path}")
     
     # Factory para entornos
     def env_factory():
         return StarshipGymEnv(task=task, max_steps=750, version=version,
-                              curriculum_phase=curriculum_phase)
+                              curriculum_phase=curriculum_phase,
+                              render_layout=render_layout)
     
     # Crear entornos vectorizados
     print("🚀 Creando entornos...")
     env = make_vec_env(env_factory, n_envs=n_envs, seed=seed,
                        vec_env_cls=SubprocVecEnv if n_envs > 1 else DummyVecEnv)
     
-    # Normalización con parámetros optimizados
+    # Compact V2 restores observation normalization in both environments.
+    # Evaluation freezes its statistics and receives the training statistics
+    # through sync_envs_normalization; reward normalization remains disabled.
+    normalize_observations = True
+    normalization_gamma = 0.995 if version == "v2" else 0.998
     env = VecNormalize(
         env,
-        norm_obs=True,
+        norm_obs=normalize_observations,
         norm_reward=False,
         clip_obs=10.0,
         clip_reward=10.0,  # Clip más alto para rewards grandes
-        gamma=0.998
+        gamma=normalization_gamma
     )
     
     # Crear entorno de evaluación
     print("📹 Configurando evaluación...")
     eval_env = DummyVecEnv([lambda: Monitor(
         StarshipGymEnv(task=task, max_steps=750, render_mode='rgb_array', version=version,
-                       curriculum_phase=curriculum_phase)
+                       curriculum_phase=curriculum_phase,
+                       render_layout=render_layout)
     )])
     eval_env = VecNormalize(
         eval_env,
-        norm_obs=True,
+        norm_obs=normalize_observations,
         norm_reward=False,  # No normalizar rewards en eval
         clip_obs=10.0,
         clip_reward=10.0,  # Clip más alto para rewards grandes
-        gamma=0.998,
+        gamma=normalization_gamma,
         training=False
     )
     
     # Crear modelo
     print("🤖 Creando modelo SAC optimizado...")
-    model = create_optimized_sac_model(env, log_path)
+    model = create_optimized_sac_model(
+        env,
+        log_path,
+        version=version,
+        curriculum_phase=curriculum_phase,
+    )
     
     # ═══════════════════════════════════════════════════════════════
     # CALLBACKS
@@ -559,12 +696,13 @@ def train_starship_sac(load=False, seed=42,
     print("⚙️ Configurando callbacks...")
     
     # 1. Evaluación
-    eval_callback = EvalCallback(
+    eval_callback = LandingEvalCallback(
         eval_env,
-        best_model_save_path=model_save_path,
+        store=checkpoint_store,
+        eval_seed=seed + 100_000,
         log_path=log_path,
         eval_freq=max(25_000 // n_envs, 1),  # Más frecuente
-        n_eval_episodes=10,
+        n_eval_episodes=30,
         deterministic=True,
         render=False,
         verbose=1
@@ -586,6 +724,7 @@ def train_starship_sac(load=False, seed=42,
     # Combinar callbacks
     all_callbacks = [
         eval_callback,
+        PeriodicCheckpointCallback(checkpoint_store),
         progress_callback,
         # curriculum_callback,
         video_callback,
@@ -614,16 +753,14 @@ def train_starship_sac(load=False, seed=42,
         
         # Guardar modelo final
         print("\n💾 Guardando modelo final...")
-        model.save(f"{model_save_path}/final_model")
-        env.save(f"{model_save_path}/vec_normalize.pkl")
+        checkpoint_store.save(model, 'final', replay=True)
         
         print("✅ Entrenamiento completado exitosamente!")
         
     except KeyboardInterrupt:
         print("\n⚠️ Entrenamiento interrumpido por usuario")
         print("💾 Guardando checkpoint...")
-        model.save(f"{model_save_path}/interrupted_checkpoint")
-        env.save(f"{model_save_path}/vec_normalize_checkpoint.pkl")
+        checkpoint_store.save(model, 'interrupted', replay=True)
         
     except Exception as e:
         print(f"\n❌ Error durante entrenamiento: {e}")
@@ -661,14 +798,16 @@ class VideoRecordingCallback(BaseCallback):
             # 🔥 FIX: Sincronizar VecNormalize ANTES de grabar
             training_env = self.model.get_env()
             if isinstance(self.eval_env, VecNormalize) and isinstance(training_env, VecNormalize):
-                # Copiar estadísticas actuales del training env
-                self.eval_env.obs_rms = training_env.obs_rms
-                self.eval_env.ret_rms = training_env.ret_rms
-                
-                if self.verbose:
+                # La utilidad oficial comprueba si realmente existe obs_rms.
+                # Keep the guard for checkpoints that disabled normalization.
+                sync_envs_normalization(training_env, self.eval_env)
+
+                if self.verbose and training_env.norm_obs:
                     mean_x = self.eval_env.obs_rms.mean[0]
                     mean_y = self.eval_env.obs_rms.mean[1]
                     print(f"[Video] Sincronizado VecNormalize (x̄={mean_x:.2f}, ȳ={mean_y:.2f})")
+                elif self.verbose:
+                    print("[Video] V2 usa escalado fisico fijo; no requiere obs_rms")
             
             video_name = f"starship_sac_{self.num_timesteps:09d}"
             recorder = VecVideoRecorder(
@@ -711,10 +850,18 @@ if __name__ == "__main__":
                       help="Evaluar un checkpoint sin entrenarlo")
     parser.add_argument("--vecnorm", metavar="VECNORMALIZE.pkl",
                         help="Normalizador asociado al checkpoint (obligatorio para reanudar/evaluar)")
+    parser.add_argument(
+        "--replay-buffer",
+        metavar="REPLAY_BUFFER.pkl",
+        help=(
+            "Replay buffer SAC asociado al checkpoint (opcional con --resume). "
+            "Requiere el mismo contrato de entorno y número de entornos."
+        ),
+    )
     parser.add_argument("--timesteps", type=int, default=300_000,
                         help="Pasos adicionales al usar --resume (por defecto: 300000)")
-    parser.add_argument("--n-envs", type=int, default=6,
-                        help="Entornos paralelos al usar --resume (por defecto: 6)")
+    parser.add_argument("--n-envs", type=int, default=8,
+                        help="Entornos paralelos al usar --resume (por defecto: 8)")
     parser.add_argument("--episodes", type=int, default=10,
                         help="Episodios deterministas al usar --evaluate (por defecto: 10)")
     parser.add_argument("--learning-rate", type=float, default=1e-4,
@@ -727,17 +874,41 @@ if __name__ == "__main__":
         default=DEFAULT_VERSION,
         help=f"Versión del entorno (por defecto: {DEFAULT_VERSION})",
     )
-    parser.add_argument("--phase", choices=tuple(CURRICULUM_PHASES),
-                        default=DEFAULT_CURRICULUM_PHASE,
-                        help=f"Fase del curriculum V1 (por defecto: {DEFAULT_CURRICULUM_PHASE})")
+    parser.add_argument(
+        "--phase",
+        choices=tuple(CURRICULUM_PHASES),
+        default=None,
+        help=(
+            "Fase del curriculum. Por defecto usa v2_phase_1a para V2 y "
+            f"{DEFAULT_CURRICULUM_PHASE} para las versiones V1."
+        ),
+    )
     parser.add_argument(
         "--activation-visualization",
         action="store_true",
         help="Generar GIF del actor y MP4 combinado durante --evaluate",
     )
+    parser.add_argument(
+        "--render-layout",
+        choices=("default", "close_pad"),
+        default="default",
+        help=(
+            "Composicion de video: default conserva el render existente; "
+            "close_pad usa camara cercana y proyeccion cenital del pad."
+        ),
+    )
     args = parser.parse_args()
+    selected_version = VERSION_ALIASES.get(args.version, args.version)
+    if args.phase is None:
+        args.phase = (
+            "v2_phase_1a"
+            if selected_version == "v2"
+            else DEFAULT_CURRICULUM_PHASE
+        )
     if args.activation_visualization and not args.evaluate:
         parser.error("--activation-visualization solo se puede usar con --evaluate")
+    if args.replay_buffer and not args.resume:
+        parser.error("--replay-buffer solo se puede usar junto con --resume")
     
     if args.resume:
         if not args.vecnorm:
@@ -746,6 +917,8 @@ if __name__ == "__main__":
             parser.error(f"No existe el checkpoint: {args.resume}")
         if not os.path.isfile(args.vecnorm):
             parser.error(f"No existe el VecNormalize: {args.vecnorm}")
+        if args.replay_buffer and not os.path.isfile(args.replay_buffer):
+            parser.error(f"No existe el replay buffer: {args.replay_buffer}")
 
         print(f"📂 Cargando modelo desde: {args.resume}")
         set_reproducible_seed(args.seed)
@@ -754,6 +927,8 @@ if __name__ == "__main__":
         task = 'landing'
         version, version_config = resolve_version(args.version)
         output_name = version_config['output_name']
+        if version == "v2":
+            output_name = f"{output_name}_{args.phase}"
         total_timesteps = args.timesteps
         n_envs = args.n_envs
         model_save_path = f"./models/{output_name}_resumed"
@@ -775,11 +950,19 @@ if __name__ == "__main__":
         os.makedirs(model_save_path, exist_ok=True)
         os.makedirs(log_path, exist_ok=True)
         os.makedirs(resumed_video_path, exist_ok=True)
+
+        checkpoint_store = CheckpointStore(
+            model_save_path, version, args.phase, args.seed, source=args.resume
+        )
+        log_path = os.path.join(log_path, checkpoint_store.path.name)
+        os.makedirs(log_path, exist_ok=True)
+        print(f"[Logs] TensorBoard and evaluations: {log_path}")
         
         # Factory para entornos
         def env_factory():
             return StarshipGymEnv(task=task, max_steps=750, version=version,
-                                  curriculum_phase=args.phase)
+                                  curriculum_phase=args.phase,
+                                  render_layout=args.render_layout)
         
         # Crear entornos vectorizados
         print("🚀 Creando entornos...")
@@ -801,7 +984,8 @@ if __name__ == "__main__":
         print("📹 Configurando evaluación...")
         eval_env = DummyVecEnv([lambda: Monitor(
             StarshipGymEnv(task=task, max_steps=750, render_mode='rgb_array', version=version,
-                           curriculum_phase=args.phase)
+                           curriculum_phase=args.phase,
+                           render_layout=args.render_layout)
         )])
         eval_env = VecNormalize.load(vecnorm_path, eval_env)
         eval_env.training = False
@@ -809,7 +993,13 @@ if __name__ == "__main__":
         
         # Cargar modelo
         print(f"🤖 Cargando modelo SAC...")
-        model = SAC.load(args.resume, env=env, device="auto")
+        # Without replay, retain the update warm-up but collect with the
+        # loaded policy instead of sampling uniform random ON/OFF commands.
+        resume_model_class = SAC if args.replay_buffer else PolicyWarmupSAC
+        model = resume_model_class.load(args.resume, env=env, device="auto")
+        # Loaded models retain their original TensorBoard directory.
+        # Route this continuation to its own phase/session before learn().
+        model.tensorboard_log = log_path
         model.set_random_seed(args.seed)
         model.learning_rate = args.learning_rate
         model.lr_schedule = lambda _: args.learning_rate
@@ -817,22 +1007,69 @@ if __name__ == "__main__":
             if optimizer is not None:
                 for param_group in optimizer.param_groups:
                     param_group['lr'] = args.learning_rate
-        # SAC.save() no incluye el replay buffer. Antes de entrenar de nuevo,
-        # llenamos un buffer nuevo con experiencias de la física/rewards
-        # actuales; num_timesteps se conserva para no reiniciar los logs.
-        model.learning_starts = model.num_timesteps + 50_000
-        print("🧠 Warm-up de replay buffer: 50,000 transiciones nuevas antes de actualizar la red")
+        if args.replay_buffer:
+            print(f"🧠 Cargando replay buffer desde: {args.replay_buffer}")
+            model.load_replay_buffer(args.replay_buffer)
+
+            replay_buffer = model.replay_buffer
+            buffer_n_envs = int(replay_buffer.n_envs)
+            if buffer_n_envs != n_envs:
+                raise ValueError(
+                    "El replay buffer fue creado con "
+                    f"{buffer_n_envs} entornos, pero --n-envs={n_envs}. "
+                    f"Repite el comando con --n-envs {buffer_n_envs}."
+                )
+
+            expected_obs_shape = tuple(env.observation_space.shape)
+            buffer_obs_shape = tuple(replay_buffer.obs_shape)
+            if buffer_obs_shape != expected_obs_shape:
+                raise ValueError(
+                    "Observaciones incompatibles entre replay buffer y entorno: "
+                    f"{buffer_obs_shape} != {expected_obs_shape}."
+                )
+
+            expected_action_dim = int(np.prod(env.action_space.shape))
+            if int(replay_buffer.action_dim) != expected_action_dim:
+                raise ValueError(
+                    "Acciones incompatibles entre replay buffer y entorno: "
+                    f"{replay_buffer.action_dim} != {expected_action_dim}."
+                )
+
+            # num_timesteps ya supera normalmente learning_starts. Dejarlo a
+            # cero hace explícito que un buffer restaurado no necesita warm-up.
+            model.learning_starts = 0
+            stored_transitions = (
+                replay_buffer.buffer_size * replay_buffer.n_envs
+                if replay_buffer.full
+                else replay_buffer.pos * replay_buffer.n_envs
+            )
+            print(
+                "✅ Replay buffer restaurado: "
+                f"{stored_transitions:,} transiciones; entrenamiento inmediato"
+            )
+        else:
+            # SAC.save() no incluye el replay buffer. Recoger experiencias con
+            # la política cargada antes de actualizar. PolicyWarmupSAC separa
+            # este umbral de aprendizaje del muestreo de acciones: nunca usa
+            # action_space.sample() durante el warm-up del resume.
+            model.learning_starts = model.num_timesteps + 50_000
+            print(
+                "🧠 Sin replay buffer: recogida de 50,000 transiciones con "
+                "la política cargada (sin acciones uniformes aleatorias). "
+                "Las redes se actualizarán después de esta recogida."
+            )
         print(f"🔢 Timesteps previos: {model.num_timesteps:,}")
         
         # Configurar callbacks (IDÉNTICOS al original)
         print("⚙️ Configurando callbacks...")
         
-        eval_callback = EvalCallback(
+        eval_callback = LandingEvalCallback(
             eval_env,
-            best_model_save_path=model_save_path,
+            store=checkpoint_store,
+            eval_seed=args.seed + 100_000,
             log_path=log_path,
-            eval_freq=25000,
-            n_eval_episodes=10,
+            eval_freq=max(25_000 // n_envs, 1),
+            n_eval_episodes=30,
             deterministic=True,
             render=False,
             verbose=1
@@ -850,6 +1087,7 @@ if __name__ == "__main__":
         
         all_callbacks = [
             eval_callback,
+            PeriodicCheckpointCallback(checkpoint_store),
             progress_callback,
             video_callback,
         ]
@@ -874,16 +1112,14 @@ if __name__ == "__main__":
             
             # Guardar modelo final
             print("\n💾 Guardando modelo final...")
-            model.save(f"{model_save_path}/final_model")
-            env.save(f"{model_save_path}/vec_normalize.pkl")
+            checkpoint_store.save(model, 'final', replay=True)
             
             print("✅ Reentrenamiento completado exitosamente!")
             
         except KeyboardInterrupt:
             print("\n⚠️ Entrenamiento interrumpido por usuario")
             print("💾 Guardando checkpoint...")
-            model.save(f"{model_save_path}/interrupted_checkpoint")
-            env.save(f"{model_save_path}/vec_normalize_checkpoint.pkl")
+            checkpoint_store.save(model, 'interrupted', replay=True)
             
         except Exception as e:
             print(f"\n❌ Error durante reentrenamiento: {e}")
@@ -910,7 +1146,7 @@ if __name__ == "__main__":
         # === Rutas ===
         model_path = args.evaluate
         vecnorm_path = args.vecnorm
-        video_folder = f"./videos/evaluation/{version}/"
+        video_folder = f"./videos/evaluation/{version}/{args.phase}/"
         os.makedirs(video_folder, exist_ok=True)
 
         # === Crear entorno ===
@@ -922,6 +1158,7 @@ if __name__ == "__main__":
                 render_mode="rgb_array",
                 version=version,
                 curriculum_phase=args.phase,
+                render_layout=args.render_layout,
             ))
 
         eval_env = DummyVecEnv([make_eval_env])
@@ -1087,4 +1324,5 @@ if __name__ == "__main__":
             seed=args.seed,
             curriculum_phase=args.phase,
             version=args.version,
+            render_layout=args.render_layout,
         )

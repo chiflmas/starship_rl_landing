@@ -44,11 +44,39 @@ V1_1_INPUT_LABELS = (
     "time remaining",
 )
 
+V2_INPUT_LABELS = (
+    "x",
+    "y",
+    "vx",
+    "vy",
+    "theta",
+    "angular rate",
+    "elapsed time",
+    "left gimbal",
+    "centre gimbal",
+    "right gimbal",
+    "AGL",
+    "left throttle",
+    "centre throttle",
+    "right throttle",
+    "left engine state",
+    "centre engine state",
+    "right engine state",
+)
+
+V1_ACTION_LABELS = ("Throttle", "Gimbal")
+V2_ACTION_LABELS = (
+    "Throttle L", "Throttle C", "Throttle R",
+    "Gimbal L", "Gimbal C", "Gimbal R",
+    "ON/OFF L", "ON/OFF C", "ON/OFF R",
+)
+
 
 def _input_labels(observation_dims):
     labels_by_dimension = {
         len(V1_INPUT_LABELS): V1_INPUT_LABELS,
         len(V1_1_INPUT_LABELS): V1_1_INPUT_LABELS,
+        len(V2_INPUT_LABELS): V2_INPUT_LABELS,
     }
     try:
         return labels_by_dimension[int(observation_dims)]
@@ -56,6 +84,20 @@ def _input_labels(observation_dims):
         raise ValueError(
             "No hay etiquetas de visualizacion para un vector de "
             f"{observation_dims} observaciones."
+        ) from exc
+
+
+def _action_labels(action_dims):
+    labels_by_dimension = {
+        len(V1_ACTION_LABELS): V1_ACTION_LABELS,
+        len(V2_ACTION_LABELS): V2_ACTION_LABELS,
+    }
+    try:
+        return labels_by_dimension[int(action_dims)]
+    except KeyError as exc:
+        raise ValueError(
+            "No hay etiquetas de visualizacion para un vector de "
+            f"{action_dims} acciones."
         ) from exc
 
 
@@ -155,7 +197,7 @@ def _blend_with_white(color, strength):
     )
 
 
-def _draw_node(canvas, position, value, scale, base_color, radius=17):
+def _draw_node(canvas, position, value, scale, base_color, radius=8):
     strength = min(abs(float(value)) / max(scale, 1e-6), 1.0)
     color = _blend_with_white(base_color, 0.18 + 0.82 * strength)
     cv2.circle(canvas, position, radius, color, -1, cv2.LINE_AA)
@@ -224,6 +266,7 @@ def _prepare_episode(samples, actor, shown_neurons):
 
     return {
         "input_labels": _input_labels(observations.shape[1]),
+        "action_labels": _action_labels(actions.shape[1]),
         "observations": observations,
         "actions": actions,
         "hidden_1": hidden_1,
@@ -249,9 +292,13 @@ def _render_network_frame(sample, prepared, frame_index, phase, status,
 
     input_labels = prepared["input_labels"]
     input_positions = _positions(245, len(input_labels), 80, 635)
-    h1_positions = _positions(520, len(prepared["h1_indices"]), 105, 610)
-    h2_positions = _positions(795, len(prepared["h2_indices"]), 105, 610)
-    output_positions = [(1045, 270), (1045, 450)]
+    h1_positions = _positions(520, len(prepared["h1_indices"]), 85, 635)
+    h2_positions = _positions(795, len(prepared["h2_indices"]), 85, 635)
+    output_positions = (
+        [(1045, 270), (1045, 450)]
+        if len(prepared["action_labels"]) == 2
+        else _positions(1045, len(prepared["action_labels"]), 80, 635)
+    )
 
     observation = sample.observation
     hidden_1 = sample.hidden_1[prepared["h1_indices"]]
@@ -291,18 +338,32 @@ def _render_network_frame(sample, prepared, frame_index, phase, status,
         _draw_node(canvas, position, value, prepared["h2_scale"], (117, 144, 180))
         _put_text(canvas, str(int(neuron_index)), (position[0] + 21, position[1] + 5), 0.32)
 
-    throttle_command = float(np.clip(action[0], 0.0, 1.0))
-    physical_throttle = throttle_command ** 3
-    gimbal_command = float(np.clip(action[1], -1.0, 1.0))
-    gimbal_degrees = 30.0 * gimbal_command
-    _draw_node(canvas, output_positions[0], throttle_command, 1.0, (225, 91, 95), 22)
-    _draw_node(canvas, output_positions[1], gimbal_command, 1.0, (225, 91, 95), 22)
-    _put_text(canvas, "Throttle", (1080, 259), 0.46)
-    _put_text(canvas, f"cmd {throttle_command:.2f} | physical {100*physical_throttle:.1f}%",
-              (1080, 281), 0.37, (82, 92, 108))
-    _put_text(canvas, "Gimbal", (1080, 439), 0.46)
-    _put_text(canvas, f"cmd {gimbal_command:+.2f} | {gimbal_degrees:+.1f} deg",
-              (1080, 461), 0.37, (82, 92, 108))
+    if len(action) == 2:
+        throttle_command = float(np.clip(action[0], 0.0, 1.0))
+        physical_throttle = throttle_command ** 3
+        gimbal_command = float(np.clip(action[1], -1.0, 1.0))
+        gimbal_degrees = 30.0 * gimbal_command
+        _draw_node(canvas, output_positions[0], throttle_command, 1.0, (225, 91, 95), 22)
+        _draw_node(canvas, output_positions[1], gimbal_command, 1.0, (225, 91, 95), 22)
+        _put_text(canvas, "Throttle", (1080, 259), 0.46)
+        _put_text(canvas, f"cmd {throttle_command:.2f} | physical {100*physical_throttle:.1f}%",
+                  (1080, 281), 0.37, (82, 92, 108))
+        _put_text(canvas, "Gimbal", (1080, 439), 0.46)
+        _put_text(canvas, f"cmd {gimbal_command:+.2f} | {gimbal_degrees:+.1f} deg",
+                  (1080, 461), 0.37, (82, 92, 108))
+    else:
+        for label, position, value in zip(
+            prepared["action_labels"], output_positions, action
+        ):
+            _draw_node(canvas, position, value, 1.0, (225, 91, 95), 16)
+            _put_text(canvas, label, (1070, position[1] - 3), 0.36)
+            _put_text(
+                canvas,
+                f"{value:+.2f}",
+                (1070, position[1] + 16),
+                0.31,
+                (82, 92, 108),
+            )
 
     _put_text(canvas, "Policy inputs (after VecNormalize)", (28, 43), 0.56, thickness=2)
     _put_text(canvas, "Hidden layer 1", (455, 43), 0.56, thickness=2)
@@ -339,7 +400,7 @@ def export_activation_visualization(
     episode_number,
     phase,
     status,
-    shown_neurons=24,
+    shown_neurons=36,
     video_fps=20,
     
     gif_fps=10,

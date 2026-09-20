@@ -1,4 +1,49 @@
-# Starship V1/V1.1: terminal landing with reinforcement learning
+# Starship V1/V1.1/V2: terminal landing with reinforcement learning
+
+## Checkpoint saving (current workflow)
+
+New training and `--resume` create a unique UTC session directory under the
+model output folder. Existing checkpoints are preserved. Within each session:
+TensorBoard events and `evaluations.npz` are also isolated under
+`logs/<version-and-phase>/<session-id>/`, using the same session ID as the
+checkpoints. Resume explicitly redirects TensorBoard to the new session rather
+than retaining the directory stored in the source model. Fresh V2 training uses
+`ent_coef="auto_0.01"` and `target_entropy=-9`; resume retains learned entropy.
+
+| Snapshot | When | Contents |
+| --- | --- | --- |
+| `best_<steps>_<id>/` | Highest evaluation success rate; mean reward breaks ties | `model.zip`, `vec_normalize.pkl`, `metadata.json` |
+| `periodic_<steps>_<id>/` | Every 100,000 additional transitions, after rollout collection | Same files plus `replay_buffer.pkl` |
+| `final_<steps>_<id>/` | Normal completion | Same files plus replay buffer |
+| `interrupted_<steps>_<id>/` | Ctrl+C | Same files plus replay buffer |
+
+`best.json`, `periodic.json`, `final.json` and `interrupted.json` point to the
+latest complete bundle of that kind. Best snapshots are retained, not replaced
+by worse policies. Selection uses 30 deterministic episodes every 25,000
+transitions, with the same scenario sequence seeded by training seed + 100,000.
+Each resumed session selects its own best; scores across phases are not comparable.
+
+Always use the model and normalizer from the **same bundle**. For example,
+set `$snapshot` to the complete directory printed by `[Checkpoints] best:`:
+
+```powershell
+python main.py --version v2 --phase v2_phase_1a --evaluate "$snapshot/model.zip" --vecnorm "$snapshot/vec_normalize.pkl"
+```
+
+To resume a periodic/final/interrupted bundle, set `$snapshot` to its directory:
+
+```powershell
+python main.py --version v2 --phase v2_phase_1a --resume "$snapshot/model.zip" --vecnorm "$snapshot/vec_normalize.pkl" --replay-buffer "$snapshot/replay_buffer.pkl" --n-envs 8
+```
+
+Use the `n_envs` recorded in `metadata.json` when restoring replay memory.
+Best bundles omit replay memory to keep repeated improvements inexpensive;
+resume those without `--replay-buffer`. An interrupted write leaves a
+`.pending_*` directory and does not update the manifest. Periodic snapshots
+are retained without automatic deletion and consume disk space, especially
+their replay buffers. Old flat-file examples below apply only to older runs;
+the current workflow uses the bundle paths above. Saving is recoverable training
+state, not a guarantee of bit-for-bit continuation of simulator/RNG state.
 
 An educational 2D environment in which a **Soft Actor-Critic (SAC)** agent
 learns the terminal portion of a Starship-inspired landing: belly flop, flip,
@@ -10,10 +55,10 @@ braking manoeuvre, touchdown, engine shutdown, and post-contact stability.
 > context for a reinforcement-learning experiment that can be expanded in
 > controlled increments.
 
-V1 deliberately uses one centred virtual actuator. Later versions can add
-independent engines, propellant, ignition constraints, failures, weather,
-sensors, and other sources of uncertainty without hiding the learning problem
-behind all of that complexity from the beginning.
+V1 deliberately uses one centred virtual actuator. The isolated V2 environment
+introduces three independently throttled and gimballed engines while preserving
+the symmetric V1 physics. Later iterations can add propellant, ignition
+constraints, failures, weather, sensors, and other sources of uncertainty.
 
 ## Acknowledgement
 
@@ -120,6 +165,89 @@ The actor emits two continuous commands:
 Gimbal movement is rate-limited to one degree per physics step. With a 20 Hz
 simulation, the maximum commanded gimbal rate is therefore 20 degrees/s.
 
+### V2 three-engine variant
+
+V2 is isolated from both the single-engine versions and the recovered legacy
+environment. It shares the V1 curriculum, inertia, aerodynamic belly-flop
+moment, angle wrapping, ground contact, success criteria, and mirror-symmetric
+left/right dynamics.
+
+Its three engines are placed at `x = -1.15, 0, +1.15 m`. Each healthy engine has
+a maximum sea-level thrust of 2.45 MN. V2 exposes nine independent actions:
+three throttle commands, three gimbal commands, and three ON/OFF signals. The
+engine gate uses a Schmitt-style latch: signals at or above `+0.20` ignite or
+keep an engine ON, signals at or below `0.0` command OFF, and values between
+`0.0` and `+0.20` preserve the previous state. Once an ignited engine is shut
+down it is permanently locked out for the remainder of that episode. While
+active, throttle `u` maps linearly to
+`30% + 70% * u`. Every initial ignition first produces exactly 30%
+thrust for one 50 ms physics step, independently of the stored throttle
+command. From the following step, physical throttle applies the linear command
+directly; V2 has no additional throttle ramp. The three gimbal actions cover
+`+/-30 degrees`, with the same 20 degrees/s slew limit as V1. Random engine
+failures remain disabled.
+
+V2 uses a reconstructed 17-value compact observation contract with
+`-1/0/+1` engine state encoding. Training uses `norm_obs=True` and
+`norm_reward=False`; evaluation uses the associated frozen VecNormalize.
+
+| Group | Count | Values |
+| --- | ---: | --- |
+| Vehicle and episode state | 7 | `x`, `y`, `vx`, `vy`, angle, angular rate, elapsed time |
+| Engine gimbals | 3 | Current left, centre, and right gimbal |
+| Altitude context | 1 | AGL |
+| Physical throttles | 3 | Current left, centre, and right physical throttle |
+| Engine state | 3 | `-1` unavailable, `0` ready/OFF, `+1` ON |
+
+Unavailable includes curriculum-disabled, failed and permanently shut-down
+engines. Engine health and lockout remain separate internally. Phase 1A starts
+with state codes `[-1, 0, -1]` and only its centre engine enabled, initially
+OFF. The agent controls ignition and shutdown: remaining OFF before ignition
+preserves availability, but shutting down after ignition permanently locks
+the engine for that episode. Phases 1B and 1C use the same lifecycle:
+1B starts with codes `[0, -1, 0]` (two lateral engines available), and 1C
+with `[0, 0, 0]` (all three available). No engine is forced ON in these phases.
+
+This is a controlled reconstruction of the observation representation and
+normalization, not an exact historical rollback: current rewards, SAC settings
+and curriculum remain in place. Train from scratch; split 23-input checkpoints
+and replay buffers are incompatible. New runs use
+`v2_three_engine_compact17_<phase>` output folders to preserve previous runs.
+
+The V2 reward is a separate copy of the V1.1 progress-based reward. It does
+not prescribe which engines to use, a throttle schedule, a burn altitude, or
+a gimbal allocation. Engine shutdown is irreversible within an episode. It
+therefore receives a small convex option cost of
+`-5 * delta(locked_engines**2)`: the first shutdown costs `-5`, the second
+`-15`, and the third `-25`. This uses no speed, altitude, stopping-distance
+model, or prescribed engine sequence. The actuator itself prevents artificial
+pulse-width modulation, so there is no repeated ON/OFF switching cost. V2
+additionally rewards reduction in AGL by `0.20` per
+metre, clipped to two metres per step. The scale transitions smoothly from
+`0.20` to `0.60` between 15 and 10 m AGL, then remains at `0.60` through
+touchdown to give slow terminal descent a useful learning signal. The same
+term becomes negative during ascent, so the stronger terminal shaping cannot
+be farmed by repeatedly climbing and descending. Hover still earns no
+vertical-progress reward, while ascent is also penalised up to `-3.0` per
+step. The additional unpowered-risk term remains zero above 300 m. From 300
+to 100 m a smooth penalty grows with downward speed up to `-1.0`, and the positive ground-progress
+term is reduced by the same risk factor. This supplies a broad safety signal
+without calculating an optimal ignition point. Rotation beyond 90 degrees is
+also penalised progressively up to `-3.0` at 120 degrees, leaving the normal
+75-87 degree belly-flop spawn unaffected. An interruption of an already-started burn that leaves every curriculum-enabled
+engine OFF while the vehicle is airborne and descending receives a one-time
+deadstick penalty of
+`-(200 + 10 * min(downward_speed, 20))`. Initial OFF engines, engines disabled
+by the curriculum, and automatic engine cutoff after touchdown are excluded.
+An available engine that has never ignited does not suppress this penalty once
+another engine has been shut down permanently; it must be ignited as part of
+the same transition to preserve continuous thrust.
+A successful V2 landing receives `+1000`, making rare valid touchdowns unambiguous relative
+to the `-200` crash and `-350` timeout. The `-0.02` per-step cost and timeout
+ordering make waiting indefinitely worse than attempting a landing. V1,
+V1.1, V2, and legacy checkpoints are mutually incompatible and require their
+own `VecNormalize` files.
+
 ## Curriculum learning
 
 The complete manoeuvre was too difficult to explore reliably from random SAC
@@ -136,9 +264,22 @@ vehicle approaches.
 | `phase_2` | 180-300 m | 30-50 m | 3-5 m/s | -40 to -25 m/s | 15-30 deg | 0-4 deg/s |
 | `phase_3` | 500-600 m | 150-200 m | 9-15 m/s | -95 to -85 m/s | 75-85 deg, plus +/-2 deg noise | 0 deg/s |
 
-`phase_1` is the default. The curriculum phase is selected explicitly with
-`--phase`; promotion is currently a manual training decision rather than an
-automatic callback.
+V2 adds an actuator curriculum before its higher-energy phases:
+
+| Phase | Available engines | AGL | Absolute x | vy | Absolute tilt |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `v2_phase_1a` | centre | 80-120 m | 0-8 m | -20 to -12 m/s | 0.5-3 deg |
+| `v2_phase_1b` | left and right | 100-160 m | 5-15 m | -28 to -18 m/s | 1-5 deg |
+| `v2_phase_1c` | all three | 160-220 m | 10-20 m | -35 to -25 m/s | 2-6 deg |
+
+Curriculum-disabled engines remain healthy and OFF; a separate phase mask
+ignores their actions without presenting them as failed or locked out. Its
+effect is now exposed through the three `engine available` observations, which
+supports policy transfer between phases without confusing disabled engines
+with available engines that have not yet ignited.
+`v2_phase_1` remains an alias of `v2_phase_1c` for old commands. The CLI
+defaults to `phase_1` for V1/V1.1 and `v2_phase_1a` for V2.
+Promotion is a manual training decision rather than an automatic callback.
 
 ## Reward design
 
@@ -280,9 +421,23 @@ Start V1.1 with the same curriculum conditions:
 python main.py --version v1_1 --phase phase_1 --seed 42
 ```
 
-Fresh training currently runs for four million environment timesteps with six
+Start the isolated three-engine V2 actuator curriculum from Phase 1A:
+
+```powershell
+python main.py --version v2 --phase v2_phase_1a --seed 42
+```
+
+Fresh training currently runs for four million environment timesteps with eight
 parallel environments. Models, normalisation statistics, TensorBoard events,
 and periodic videos are written under `models/`, `logs/`, and `videos/`.
+V2 adds the selected phase to those output directories, so Phase 1A, 1B, and
+1C checkpoints and TensorBoard runs do not overwrite one another.
+
+Interrupting either a fresh or resumed SAC run with `Ctrl+C` writes a
+synchronised recovery set containing `interrupted_checkpoint.zip`,
+`vec_normalize_checkpoint.pkl`, and `replay_buffer_checkpoint.pkl`. The replay
+buffer is stored separately because it is not included in the normal SAC model
+archive.
 
 Start TensorBoard:
 
@@ -308,9 +463,10 @@ python main.py `
   --version v1 `
   --resume .\models\v1_single_engine\final_model.zip `
   --vecnorm .\models\v1_single_engine\vec_normalize.pkl `
+  --replay-buffer .\models\v1_single_engine\replay_buffer_checkpoint.pkl `
   --phase phase_2 `
   --timesteps 300000 `
-  --n-envs 6 `
+  --n-envs 8 `
   --learning-rate 1e-4 `
   --seed 42
 ```
@@ -318,12 +474,17 @@ python main.py `
 Then use the resulting checkpoint and normaliser to resume with
 `--phase phase_3`.
 
-`SAC.save()` does not include the replay buffer. Resume mode preserves the
-model weights, optimiser state, timestep counter, and `VecNormalize`
-statistics, but creates a fresh replay buffer and collects 50,000 new
-transitions before updating the network. Preserve or rename the outputs from
-each phase before launching the next one because resumed runs share the
-`models/v1_single_engine_resumed/` directory.
+`SAC.save()` does not include the replay buffer. Passing `--replay-buffer`
+restores it and starts gradient updates immediately. The buffer must have been
+created with the same observation/action contract and the same number of
+parallel environments supplied through `--n-envs`. It should also correspond
+to the supplied model and `VecNormalize` snapshot. If the option is omitted,
+resume mode creates a fresh buffer and collects 50,000 new transitions before
+updating the network. Do not reuse a buffer after changing actuator semantics,
+physics, or rewards; in particular, buffers produced before V2's corrected
+normalised gimbal mapping are incompatible. Preserve or rename the outputs
+from each phase before launching the next one because resumed runs share their
+version/phase output directory.
 
 ## Deterministic evaluation
 
@@ -346,6 +507,27 @@ the base seed or increase `--episodes` to test a different sample.
 
 Evaluation exports one MP4 per episode under `videos/evaluation/` and prints
 success, crash, timeout, reward, final altitude, and velocity summaries.
+
+Use the optional close camera and pad-relative top-view projection without
+changing physics, observations, rewards, or the default render:
+
+```powershell
+python main.py `
+  --version v2 `
+  --evaluate .\models\v2_three_engine_compact17_v2_phase_1a\final_model.zip `
+  --vecnorm .\models\v2_three_engine_compact17_v2_phase_1a\vec_normalize.pkl `
+  --phase v2_phase_1a `
+  --render-layout close_pad `
+  --episodes 10 `
+  --seed 42
+```
+
+`close_pad` increases the tracking-camera zoom from approximately `1.25x` to
+`2.5x`. Because the simulation has no lateral `z` coordinate, its top view is
+explicitly labelled as a 2-D projection: it shows the pad, the effective
+`+/-15 m` touchdown region, projected vehicle position, horizontal velocity,
+and current touchdown-envelope status. Omitting `--render-layout` preserves
+the previous video layout exactly.
 
 ## Curriculum evaluation chart
 
@@ -415,6 +597,7 @@ main.py                         Gymnasium wrapper, SAC setup, callbacks, and CLI
 rocket.py                       Dynamics, contact, success logic, and rendering
 improved_rewards_v1.py          V1 progress-based reward system
 improved_rewards_v1_1.py        Isolated V1.1 reward class
+improved_rewards_v2.py          Isolated three-engine V2 reward class
 curriculum_phases.py            Initial-state distributions for Phases 1-3
 activation_visualizer.py        Actor activation GIF and combined-video export
 combine_evaluation_episodes.py  Concatenate and accelerate evaluation media
@@ -430,8 +613,8 @@ videos are ignored by Git.
 
 1. **V1:** centred virtual actuator, terminal belly flop, curriculum learning,
    and stable touchdown.
-2. **V2:** three engines, thrust allocation, per-engine gimbal, and ignition
-   constraints.
+2. **V2:** three engines, thrust allocation, and per-engine gimbal; later V2
+   iterations can add ignition constraints and engine failures.
 3. **V3:** fuel, variable mass, failures, and propellant-margin management.
 4. **V4:** flaps, wind, weather, uncertainty, and domain randomisation.
 5. **V5:** a higher-altitude glide and transition into the terminal manoeuvre.

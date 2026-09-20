@@ -272,19 +272,34 @@ class Rocket(object):
         self.task = task
         self.rocket_type = rocket_type
         self.engine_mode = engine_mode
-        self.observation_mode = observation_mode or (
-            'v1_engineered' if engine_mode == 'single' else 'legacy'
+        default_observation_modes = {
+            'single': 'v1_engineered',
+            'three_v2': 'v2_raw',
+            'three': 'legacy',
+        }
+        self.observation_mode = observation_mode or default_observation_modes.get(
+            engine_mode, 'legacy'
         )
-        valid_observation_modes = {'v1_engineered', 'v1_raw', 'legacy'}
+        valid_observation_modes = {
+            'v1_engineered', 'v1_raw', 'v2_raw', 'legacy'
+        }
         if self.observation_mode not in valid_observation_modes:
             raise ValueError(
                 f"Unknown observation mode {self.observation_mode!r}. "
                 f"Available: {sorted(valid_observation_modes)}"
             )
-        if self.engine_mode == 'single' and self.observation_mode == 'legacy':
-            raise ValueError("Single-engine environments require a V1 observation mode")
-        if self.engine_mode != 'single' and self.observation_mode != 'legacy':
-            raise ValueError("Three-engine environments require legacy observations")
+        valid_mode_contracts = {
+            'single': {'v1_engineered', 'v1_raw'},
+            'three_v2': {'v2_raw'},
+            'three': {'legacy'},
+        }
+        if self.engine_mode not in valid_mode_contracts:
+            raise ValueError(f"Unknown engine mode {self.engine_mode!r}")
+        if self.observation_mode not in valid_mode_contracts[self.engine_mode]:
+            raise ValueError(
+                f"Engine mode {self.engine_mode!r} is incompatible with "
+                f"observation mode {self.observation_mode!r}"
+            )
         self.curriculum_phase_name = curriculum_phase
         self.curriculum_phase = get_curriculum_phase(curriculum_phase)
         self.debug_mode = False
@@ -302,14 +317,29 @@ class Rocket(object):
 
 
         if self.rocket_type == 'starship':
-            self.mass = 140_000.0
+            self.mass = 185_000.0 # 140.000 v1
             if self.engine_mode == 'single':
                 # V1: actuador virtual centrado equivalente a tres Raptor.
                 self.engine_thrust_sl = 6e6
                 self.num_engines = 1
+                self.min_engine_throttle = 0.0
+            elif self.engine_mode == 'three_v2':
+                # Three independent sea-level engines. Positive commands are
+                # constrained to the explicit 30-100 % operating interval.
+                self.engine_thrust_sl = 2.45e6
+                self.num_engines = 3
+                self.min_engine_throttle = 0.30
+                self.engine_switch_on_threshold = 0.20
+                self.engine_switch_off_threshold = 0.0
+                # Effective 2-D projection of the three-engine cluster. The
+                # recovered environment used approximately +/-1.15 m; keeping
+                # that spacing reduces differential-thrust torque without
+                # unrealistically collapsing all thrust lines to one point.
+                self.engine_x_offsets = (-1.15, 0.0, 1.15)
             else:
                 self.engine_thrust_sl = 2e6
                 self.num_engines = 3
+                self.min_engine_throttle = 0.40
             # self.min_stable_throttle = 0.4
         else:
             self.mass = 20_000.0
@@ -328,7 +358,7 @@ class Rocket(object):
         # aproximado H/5.5 (el mismo que emplea el área frontal). La versión
         # legacy de tres motores conserva su ajuste original para no alterar
         # entrenamientos ni checkpoints anteriores.
-        if self.engine_mode == 'single':
+        if self.engine_mode in {'single', 'three_v2'}:
             body_radius = self.H / (2.0 * 5.5)
             self.I = (self.mass / 12.0) * (self.H ** 2 + 3.0 * body_radius ** 2)
         else:
@@ -336,8 +366,10 @@ class Rocket(object):
 
         # Estado de motores (una sola vez)
         self.engine_available = [True] * self.num_engines
+        self.curriculum_engine_mask = [True] * self.num_engines
         self.engines_on       = [False] * self.num_engines
         self.engines_thrust   = [0.0]   * self.num_engines
+        self.engine_throttles = [0.0]   * self.num_engines
         self.engine_gimbals   = [0.0]   * self.num_engines
 
         if self.task == 'hover':
@@ -373,13 +405,15 @@ class Rocket(object):
         observation_dims = {
             'v1_engineered': 12,
             'v1_raw': 10,
+            'v2_raw': 17,
             'legacy': 23,
         }
         self.state_dims = observation_dims[self.observation_mode]
 
         if self.rocket_type == 'starship':
             # Espacio continuo: [t0, t1, t2, v0, v1, v2]
-            self.action_dims = 2 if self.engine_mode == 'single' else 9
+            action_dims = {'single': 2, 'three_v2': 9, 'three': 9}
+            self.action_dims = action_dims[self.engine_mode]
             self.continuous_action_space = True
         else:
             # Mantener compatible con Falcon (discreto)
@@ -389,6 +423,12 @@ class Rocket(object):
 
         if path_to_bg_img is None:
             path_to_bg_img = task+'.jpg'
+        # Keep the original artwork path for the native close-camera renderer.
+        # ``bg_img`` remains the legacy full-world raster used by the default
+        # layout, so that layout is bit-for-bit unaffected by the new camera.
+        self.path_to_bg_img = path_to_bg_img
+        self._close_bg_source = None
+        self._close_bg_source_loaded = False
         self.bg_img = utils.load_bg_img(path_to_bg_img, w=self.viewport_w, h=self.viewport_h)
 
         self.state_buffer = []
@@ -430,7 +470,8 @@ class Rocket(object):
         """
         Reinicia el episodio:
         - Estado inicial (aleatorio o provisto)
-        - Motores: OFF; salud, fallo y bloqueo de secuencia separados
+        - Motores: estado inicial definido por la fase; salud, fallo y bloqueo
+          de secuencia separados
         """
         # --- Estado inicial ---
         if state_dict is None:
@@ -438,9 +479,10 @@ class Rocket(object):
         else:
             self.state = state_dict
 
-        # V1 conserva la actitud inicial de belly-flop. El torque
+        # V1/V2 preserve the signed initial belly-flop attitude. The symmetric
+        # aerodynamic moment fades before the terminal landing burn.
         # aerodinámico se desvanece al entrar en el landing burn.
-        if self.engine_mode == 'single':
+        if self.engine_mode in {'single', 'three_v2'}:
             theta0 = float(self.state.get('theta', 0.0))
             theta_sign = np.sign(theta0) if abs(theta0) > 1e-6 else 1.0
             self.belly_flop_theta_reference = theta_sign * np.deg2rad(80.0)
@@ -469,20 +511,62 @@ class Rocket(object):
             self.engines_failed_at_start = []
 
         # Salud física y bloqueo de secuencia son estados distintos.
-        self.engine_operational = list(self.engine_available)
-        self.engine_failed = [not available for available in self.engine_available]
+        failure_available = list(self.engine_available)
+        curriculum_mask = self.curriculum_phase.get('engine_available_mask')
+        if self.engine_mode == 'three_v2' and curriculum_mask is not None:
+            if len(curriculum_mask) != self.num_engines:
+                raise ValueError(
+                    "engine_available_mask debe tener un valor por motor"
+                )
+            curriculum_mask = [bool(value) for value in curriculum_mask]
+        else:
+            curriculum_mask = [True] * self.num_engines
+
+        self.curriculum_engine_mask = list(curriculum_mask)
+
+        # The curriculum mask is not a physical failure or a permanent
+        # shutdown. Engine health keeps its normal V2 semantics; the mask is
+        # checked independently by the actuator while this phase is active.
+        self.engine_available = list(failure_available)
+        self.engine_operational = list(failure_available)
+        self.engine_failed = [not available for available in failure_available]
         self.engine_locked_out = [False] * self.num_engines
 
         # --- Estado instantáneo de propulsión ---
-        # Arrancamos con los motores APAGADOS (OFF) y sin empuje
-        self.engines_on = [False] * self.num_engines
-        self.engines_thrust = [0.0] * self.num_engines
+        # Por defecto arrancan apagados; el curriculum puede encender al reset
+        # únicamente los actuadores habilitados y operativos.
+        initial_on_mask = self.curriculum_phase.get(
+            'initial_engine_on_mask',
+            [False] * self.num_engines,
+        )
+        if len(initial_on_mask) != self.num_engines:
+            raise ValueError(
+                "initial_engine_on_mask debe tener un valor por motor"
+            )
+        self.engines_on = [
+            bool(initial_on)
+            and bool(curriculum_enabled)
+            and bool(operational)
+            for initial_on, curriculum_enabled, operational in zip(
+                initial_on_mask,
+                self.curriculum_engine_mask,
+                self.engine_operational,
+            )
+        ]
+        self.engine_throttles = [
+            getattr(self, 'min_engine_throttle', 0.0) if is_on else 0.0
+            for is_on in self.engines_on
+        ]
+        self.engines_thrust = [
+            throttle * self.engine_thrust_sl
+            for throttle in self.engine_throttles
+        ]
         self.engine_gimbals = [0.0] * self.num_engines
 
         self.last_action = np.zeros(self.action_dims, dtype=np.float32)
         
         # --- Memoria del sistema de recompensas ---
-        # Un motor empieza apagado, sano y sin bloqueo de secuencia.
+        # El sistema de rewards empieza cada episodio sin memoria previa.
         if hasattr(self, 'reward_system'):
             self.reward_system.reset_episode_memory()
 
@@ -507,7 +591,11 @@ class Rocket(object):
 
     def _clip_gimbal(self, phi):
         # Permitir más rango cuando solo hay motor lateral
-        if hasattr(self, 'lateral_active') and self.lateral_active:
+        if (
+            self.engine_mode == 'three'
+            and hasattr(self, 'lateral_active')
+            and self.lateral_active
+        ):
             # Mayor autoridad para motor lateral (necesita compensar desventaja)
             max_gimbal = 45.0 * np.pi / 180.0  # 45 grados
         else:
@@ -643,8 +731,8 @@ class Rocket(object):
 
     #     return state
 
-    def _create_v1_curriculum_state(self):
-        """Muestrea el spawn V1 desde la fase de curriculum seleccionada."""
+    def _create_curriculum_state(self):
+        """Muestrea un spawn simetrico desde la fase seleccionada."""
         phase = self.curriculum_phase
         side = random.choice((-1.0, 1.0))
 
@@ -710,10 +798,10 @@ class Rocket(object):
         - Posición horizontal: ±200m del target
         """
         
-        # Solo V1 usa el curriculum. El spawn recuperado de tres motores se
-        # mantiene debajo sin modificar para conservar su comportamiento.
-        if self.task == 'landing' and self.engine_mode == 'single':
-            return self._create_v1_curriculum_state()
+        # V1 and isolated V2 share the symmetric curriculum distributions.
+        # The recovered legacy three-engine spawn remains untouched below.
+        if self.task == 'landing' and self.engine_mode in {'single', 'three_v2'}:
+            return self._create_curriculum_state()
 
         x_range = self.world_x_max - self.world_x_min  # 800m
         y_range = self.world_y_max - self.world_y_min  # 1050m
@@ -724,7 +812,7 @@ class Rocket(object):
         # V1 emplea esa misma referencia; la versión recuperada se conserva.
         ground_level = (
             self.H / 2.0
-            if self.engine_mode == 'single'
+            if self.engine_mode in {'single', 'three_v2'}
             else self.world_y_min + self.H / 2.0
         )
 
@@ -1218,9 +1306,22 @@ class Rocket(object):
         enriched_state['engine_operational'] = list(_engine_operational)
         enriched_state['engine_failed'] = list(_engine_failed)
         enriched_state['engine_locked_out'] = list(_engine_locked_out)
+        enriched_state['curriculum_engine_mask'] = list(
+            getattr(self, 'curriculum_engine_mask', [True] * self.num_engines)
+        )
         enriched_state['total_thrust'] = float(sum(_engines_thrust))  # CRÍTICO: Calcular aquí
         enriched_state['engine_available'] = getattr(self, 'engine_available', [True] * self.num_engines)
         enriched_state['engines_on'] = getattr(self, 'engines_on', [False] * self.num_engines)
+        enriched_state['touchdown_contact'] = bool(self.touchdown_contact)
+        enriched_state['just_touched'] = bool(
+            getattr(self, 'just_touched', False)
+        )
+        enriched_state['impact_velocity'] = float(
+            getattr(self, 'impact_velocity', 0.0)
+        )
+        enriched_state['impact_theta'] = float(
+            getattr(self, 'impact_theta', abs(float(state['theta'])))
+        )
         enriched_state['mass'] = float(self.mass)  # CRÍTICO
         enriched_state['g'] = float(self.g)  # CRÍTICO
         
@@ -1285,7 +1386,7 @@ class Rocket(object):
             # El estado verde se mantiene varios frames para el vídeo. El bonus
             # de aterrizaje debe entregarse una sola vez, no una vez por frame.
             if not getattr(self, 'landing_reward_granted', False):
-                if is_early_exit and self.engine_mode != 'single':
+                if is_early_exit and self.engine_mode == 'three':
                     # Aterrizaje válido pero sospechosamente rápido
                     tr = terminal.get('successful_landing', 50000.0) * (_step_id / 200.0)
                 else:
@@ -1307,7 +1408,9 @@ class Rocket(object):
             tr = terminal.get('crash', -500.0)
             total_reward += tr
             components['terminal_crash'] = tr
-        elif _step_id >= _max_steps - 1:
+        elif _step_id >= _max_steps:
+            # El limite se alcanza exactamente una vez. La condicion anterior
+            # (max_steps - 1) cobraba el timeout en los steps 749 y 750.
             tr = terminal.get('timeout', -2000.0)  # 🔥 AUMENTADO de -200 a -2000
             total_reward += tr
             components['terminal_timeout'] = tr
@@ -1325,7 +1428,88 @@ class Rocket(object):
         if continuous and self.rocket_type == 'starship':
             a = np.array(action, dtype=np.float32)
             
-            if len(a) == 6:
+            if self.engine_mode == 'three_v2' and len(a) != 9:
+                raise ValueError(
+                    f"V2 expects 9 actions, received {len(a)}"
+                )
+
+            if len(a) == 9 and self.engine_mode == 'three_v2':
+                # Independent commands: three throttles, three physical
+                # gimbal angles, and three ON/OFF signals. Separating the gate
+                # from throttle lets the policy request minimum thrust without
+                # approaching the shutdown boundary. Once an ignited engine is
+                # commanded OFF it is locked out for the rest of the episode;
+                # an engine that has never ignited remains available while OFF.
+                throttle_commands = np.clip(a[:3], 0.0, 1.0)
+                # The policy action is normalized to [-1, 1]. Map it
+                # linearly to the physical +/-30 degree gimbal range before
+                # applying the existing 1 degree-per-step slew-rate limit.
+                desired_gimbals = (
+                    np.clip(a[3:6], -1.0, 1.0)
+                    * np.deg2rad(30.0)
+                )
+                on_commands = np.clip(a[6:9], -1.0, 1.0)
+                new_on, new_thrust, new_gimbal = [], [], []
+
+                for i in range(self.num_engines):
+                    if (
+                        not self.engine_operational[i]
+                        or self.engine_locked_out[i]
+                        or not self.curriculum_engine_mask[i]
+                    ):
+                        new_on.append(False)
+                        new_thrust.append(0.0)
+                        new_gimbal.append(0.0)
+                        continue
+
+                    was_on = bool(self.engines_on[i])
+                    switch_command = float(on_commands[i])
+                    force_on_in_flight = bool(
+                        self.curriculum_phase.get(
+                            'force_initial_engines_on_in_flight', False
+                        )
+                    ) and not self.touchdown_contact
+                    if force_on_in_flight:
+                        # Optional phase protection; touchdown still cuts
+                        # all engines. Normal phases leave this flag false.
+                        is_on = True
+                    elif switch_command >= self.engine_switch_on_threshold:
+                        is_on = True
+                    elif switch_command <= self.engine_switch_off_threshold:
+                        is_on = False
+                    else:
+                        # Schmitt-style latch: ambiguous commands preserve the
+                        # current state, protecting an irreversible shutdown
+                        # from small SAC exploration noise around zero.
+                        is_on = was_on
+                    if was_on and not is_on and not force_on_in_flight:
+                        self.engine_locked_out[i] = True
+
+                    if self.engine_locked_out[i] or not is_on:
+                        new_on.append(False)
+                        new_thrust.append(0.0)
+                        new_gimbal.append(0.0)
+                        continue
+
+                    just_ignited = is_on and not was_on
+                    throttle_command = float(throttle_commands[i])
+                    if just_ignited:
+                        throttle = self.min_engine_throttle
+                    else:
+                        throttle = self.min_engine_throttle + (
+                            1.0 - self.min_engine_throttle
+                        ) * throttle_command
+                    new_on.append(is_on)
+                    new_thrust.append(throttle * self.engine_thrust_sl)
+                    new_gimbal.append(self._limit_gimbal_step(
+                        i, float(desired_gimbals[i]), max_step_jump_deg=1.0
+                    ))
+
+                self.engines_on = new_on
+                self.engines_thrust = new_thrust
+                self.engine_gimbals = new_gimbal
+
+            elif len(a) == 6:
                 tvec = a[:3]  # throttles (0..1)
                 vvec = a[3:]  # gimbals (rad)
 
@@ -1382,7 +1566,7 @@ class Rocket(object):
                 self.engines_thrust = new_thrust
                 self.engine_gimbals = new_gimbal
 
-            if len(a) == 9:
+            elif len(a) == 9:
                 # Acciones extendidas con ON/OFF
                 tvec = a[:3]   # potencia normalizada (0–1)
                 # Convertir gimbals de [-1,1] a radianes (±20°)
@@ -1470,7 +1654,12 @@ class Rocket(object):
             self.engines_thrust = [t if t > 1e-3 else 0.0 for t in self.engines_thrust]
             # engines_on = True solo si hay thrust positivo (estado instantáneo)
             self.engines_on = [t > 0.0 for t in self.engines_thrust]
-            if self.engine_mode != 'single':
+            if self.engine_mode == 'three_v2':
+                self.engine_throttles = [
+                    float(np.clip(t / self.engine_thrust_sl, 0.0, 1.0))
+                    for t in self.engines_thrust
+                ]
+            if self.engine_mode == 'three':
                 self.engine_gimbals = [
                     g if on else 0.0
                     for g, on in zip(self.engine_gimbals, self.engines_on)
@@ -1498,13 +1687,20 @@ class Rocket(object):
         if self.task == 'landing' and self.touchdown_contact:
             self.engines_on = [False] * self.num_engines
             self.engines_thrust = [0.0] * self.num_engines
+            self.engine_throttles = [0.0] * self.num_engines
             self.engine_gimbals = [0.0] * self.num_engines
             f_total = 0.0
 
         # ══════════════════════════════════════════════════════════════
         # 2. GEOMETRÍA (definir UNA VEZ)
         # ══════════════════════════════════════════════════════════════
-        if self.num_engines == 3:
+        if self.engine_mode == 'three_v2':
+            H = self.H
+            nozzle_bases = [
+                (offset, -H / 2.0)
+                for offset in self.engine_x_offsets
+            ]
+        elif self.num_engines == 3:
             H, W = self.H, self.H/2.6
             nozzle_bases = [(-0.06*W, -H/2.0), (0.0, -H/2.0), (0.06*W, -H/2.0)]
         else:
@@ -1534,7 +1730,11 @@ class Rocket(object):
                 continue
             
             # 🔥 FIX: Compensación REACTIVA proporcional a error
-            if self.lateral_active and i == self.active_idx:
+            if (
+                self.engine_mode == 'three'
+                and self.lateral_active
+                and i == self.active_idx
+            ):
                 nx_base, ny_base = nozzle_bases[i]
                 
                 # ════════════════════════════════════════════════════════
@@ -1680,7 +1880,7 @@ class Rocket(object):
         v_mag = np.hypot(vx, vy) + 1e-6  # magnitud de la velocidad
         flow_angle = np.arctan2(vy, vx)  # dirección del flujo
 
-        if self.engine_mode == 'single':
+        if self.engine_mode in {'single', 'three_v2'}:
             # V1: proyección geométrica sin orientación izquierda/derecha.
             # El eje longitudinal del vehículo y el vector velocidad se
             # reflejan juntos al cambiar x, vx y theta de signo. Usar el
@@ -1721,7 +1921,7 @@ class Rocket(object):
         # ═══════════════════════════════════════════════════════════════
 
         lever_arm = (self.CoP_offset - self.CoM_offset)
-        if self.engine_mode == 'single':
+        if self.engine_mode in {'single', 'three_v2'}:
             # Equilibrio en ±80°: el momento es restaurador y cero justo en
             # la referencia. De 450 m a 350 m se desvanece para liberar el
             # giro antes del landing burn simplificado.
@@ -1735,7 +1935,11 @@ class Rocket(object):
             tau_aero = -lever_arm * F_drag * np.sin(angle_of_attack)
 
         # ---- Amortiguamiento angular ----
-        tau_damp = -self.angular_damping * vtheta
+        tau_damp = (
+            0.0
+            if self.engine_mode == 'three_v2'
+            else -self.angular_damping * vtheta
+        )
 
         # Torque total (aerodinámico + amortiguamiento)
         tau += tau_aero + tau_damp
@@ -1754,7 +1958,15 @@ class Rocket(object):
             if self.active_idx is not None and self.active_idx != 1:
                 self.lateral_active = True
 
-        if self.lateral_active:
+        if self.engine_mode == 'three_v2':
+            # One smooth, mirror-symmetric damping model. It does not change
+            # with altitude, active engine count, or selected engine side.
+            tau_drag = (
+                -self.c_omega * vtheta
+                - self.c_omega_q * vtheta * abs(vtheta)
+            )
+            tau += tau_drag
+        elif self.lateral_active:
             # 🔥 FIX: Damping reducido 6-7× para permitir control
             if altitude < 30:
                 damping_multiplier = 3.0   # Reducido de 20.0 → ×6.7 menos
@@ -1780,9 +1992,10 @@ class Rocket(object):
                 damping_multiplier = 1.0
                 quad_multiplier = 1.0
         
-        tau_drag = -(self.c_omega * damping_multiplier) * vtheta \
-                - (self.c_omega_q * quad_multiplier) * vtheta * abs(vtheta)
-        tau += tau_drag
+        if self.engine_mode != 'three_v2':
+            tau_drag = -(self.c_omega * damping_multiplier) * vtheta \
+                    - (self.c_omega_q * quad_multiplier) * vtheta * abs(vtheta)
+            tau += tau_drag
 
         # ═══════════════════════════════════════════════════════════════
         # 🔥 NUEVO: Física de suelo (auto-enderezamiento y vuelco)
@@ -1824,6 +2037,7 @@ class Rocket(object):
             f_total = 0.0
             self.engines_on = [False]*self.num_engines
             self.engines_thrust = [0.0]*self.num_engines
+            self.engine_throttles = [0.0]*self.num_engines
             self.engine_gimbals = [0.0]*self.num_engines
 
         # Integración (línea 1362-1367)
@@ -1838,7 +2052,7 @@ class Rocket(object):
         # counter.  Keeping it in [-pi, pi] makes the trigonometric
         # observation and the terminal attitude checks describe the same
         # orientation.  Legacy remains untouched for checkpoint compatibility.
-        if self.engine_mode == 'single':
+        if self.engine_mode in {'single', 'three_v2'}:
             theta_new = np.arctan2(np.sin(theta_new), np.cos(theta_new))
     
         # ══════════════════════════════════════════════════════════════
@@ -2060,6 +2274,53 @@ class Rocket(object):
         ]
         return np.asarray(observation, dtype=np.float32)
 
+    def _flatten_v2(self, state):
+        """Compact V2: 14 physical features and three engine state codes.
+
+        Engine codes: -1 unavailable (masked, failed or locked), 0 ready/OFF,
+        +1 ON. Physical throttle is reported separately. VecNormalize learns
+        the observation statistics; these fixed scales precede that wrapper.
+        This reconstruction is incompatible with the split 23-input policy.
+        """
+        altitude = max(0.0, float(state['y']) - self.H / 2.0)
+        x_norm = 2.0 * (float(state['x']) - self.world_x_min) / (
+            self.world_x_max - self.world_x_min
+        ) - 1.0
+        y_norm = 2.0 * (float(state['y']) - self.world_y_min) / (
+            self.world_y_max - self.world_y_min
+        ) - 1.0
+        gimbals = [
+            np.clip(gimbal / np.deg2rad(30.0), -1.5, 1.5)
+            for gimbal in self.engine_gimbals
+        ]
+        engine_states = [
+            -1.0 if not enabled or not operational or locked_out
+            else (1.0 if is_on else 0.0)
+            for enabled, operational, locked_out, is_on in zip(
+                self.curriculum_engine_mask,
+                self.engine_operational,
+                self.engine_locked_out,
+                self.engines_on,
+            )
+        ]
+        physical_throttles = [
+            float(np.clip(value, 0.0, 1.0))
+            for value in self.engine_throttles
+        ]
+
+        observation = [
+            x_norm,
+            y_norm,
+            np.clip(float(state['vx']) / 50.0, -2.0, 2.0),
+            np.clip(float(state['vy']) / 100.0, -2.0, 2.0),
+            float(state['theta']) / np.pi,
+            np.clip(float(state['vtheta']), -2.0, 2.0),
+            np.clip(float(state['t']) / self.max_steps, 0.0, 1.0),
+        ] + gimbals + [
+            np.clip(altitude / 200.0, 0.0, 5.0),
+        ] + physical_throttles + engine_states
+        return np.asarray(observation, dtype=np.float32)
+
     def flatten(self, state):
         """
         Normaliza el estado para la red neuronal.
@@ -2073,6 +2334,8 @@ class Rocket(object):
             return self._flatten_v1(state)
         if self.observation_mode == 'v1_raw':
             return self._flatten_v1_1(state)
+        if self.observation_mode == 'v2_raw':
+            return self._flatten_v2(state)
 
         # Legacy three-engine observation starts here and remains unchanged.
 
@@ -2164,32 +2427,58 @@ class Rocket(object):
 
     def render(self, window_name='env', wait_time=1,
            with_trajectory=True, with_camera_tracking=True,
-           crop_scale=0.4, return_rgb_array=False):
+           crop_scale=0.4, return_rgb_array=False,
+           render_layout='default'):
 
-        canvas = np.copy(self.bg_img)
+        if render_layout not in {'default', 'close_pad'}:
+            raise ValueError(
+                f"Unknown render layout {render_layout!r}; "
+                "expected 'default' or 'close_pad'"
+            )
+        native_close_camera = render_layout == 'close_pad' and with_camera_tracking
+        camera_bounds = (
+            self.close_camera_bounds(crop_scale=0.20)
+            if native_close_camera
+            else None
+        )
+        canvas = (
+            self.render_camera_background(camera_bounds)
+            if native_close_camera
+            else np.copy(self.bg_img)
+        )
         polys = self.create_polygons()
 
         # draw target region
         for poly in polys['target_region']:
-            self.draw_a_polygon(canvas, poly)
+            self.draw_a_polygon(canvas, poly, camera_bounds=camera_bounds)
         # draw rocket
         for poly in polys['rocket']:
-            self.draw_a_polygon(canvas, poly)
+            self.draw_a_polygon(canvas, poly, camera_bounds=camera_bounds)
         frame_0 = canvas.copy()
 
         # draw engine work
         for poly in polys['engine_work']:
-            self.draw_a_polygon(canvas, poly)
+            self.draw_a_polygon(canvas, poly, camera_bounds=camera_bounds)
         frame_1 = canvas.copy()
 
-        if with_camera_tracking:
-            frame_0 = self.crop_alongwith_camera(frame_0, crop_scale=crop_scale)
-            frame_1 = self.crop_alongwith_camera(frame_1, crop_scale=crop_scale)
+        # The default layout preserves the recovered crop-and-upscale camera.
+        # close_pad is already drawn directly at output resolution above.
+        if with_camera_tracking and not native_close_camera:
+            frame_0 = self.crop_alongwith_camera(
+                frame_0, crop_scale=crop_scale
+            )
+            frame_1 = self.crop_alongwith_camera(
+                frame_1, crop_scale=crop_scale
+            )
 
         # draw trajectory
         if with_trajectory:
             self.draw_trajectory(frame_0)
             self.draw_trajectory(frame_1)
+
+        if render_layout == 'close_pad':
+            self.draw_pad_top_view(frame_0)
+            self.draw_pad_top_view(frame_1)
 
         # draw text
         self.draw_text(frame_0, color=(0, 0, 0))
@@ -2357,8 +2646,20 @@ class Rocket(object):
             # --- engine work (Starship) ---
             H, W = self.H, self.H/2.6
             dl = self.H / 30.0
-            nozzle_bases = ([(0.0, -H/2.0)] if self.num_engines == 1 else
-                            [(-0.12*W, -H/2.0), (0.0, -H/2.0), (0.12*W, -H/2.0)])
+            if self.engine_mode == 'three_v2':
+                # Same offsets used by the V2 force/torque calculation.
+                nozzle_bases = [
+                    (offset, -H / 2.0)
+                    for offset in self.engine_x_offsets
+                ]
+            elif self.num_engines == 1:
+                nozzle_bases = [(0.0, -H / 2.0)]
+            else:
+                nozzle_bases = [
+                    (-0.12 * W, -H / 2.0),
+                    (0.0, -H / 2.0),
+                    (0.12 * W, -H / 2.0),
+                ]
 
             for i, (nx, ny) in enumerate(nozzle_bases):
                 thrust_i = self.engines_thrust[i] if i < len(self.engines_thrust) else 0.0
@@ -2429,10 +2730,105 @@ class Rocket(object):
 
         return polys
     
-    def draw_a_polygon(self, canvas, poly):
+    def close_camera_bounds(self, crop_scale=0.20):
+        """Return a rocket-following camera window in world coordinates.
+
+        The window matches the field of view of the old crop-based camera,
+        but is used as the input transform before rasterisation.  Clamping the
+        centre reproduces the previous behaviour close to the world edges.
+        """
+        world_width = float(self.world_x_max - self.world_x_min)
+        world_height = float(self.world_y_max - self.world_y_min)
+        half_width = world_width * float(crop_scale)
+        half_height = world_height * float(crop_scale)
+
+        centre_x = float(np.clip(
+            self.state['x'],
+            self.world_x_min + half_width,
+            self.world_x_max - half_width,
+        ))
+        centre_y = float(np.clip(
+            self.state['y'],
+            self.world_y_min + half_height,
+            self.world_y_max - half_height,
+        ))
+        return (
+            centre_x - half_width,
+            centre_x + half_width,
+            centre_y - half_height,
+            centre_y + half_height,
+        )
+
+    def _load_close_background_source(self):
+        """Load and cache the original background without first downsizing it."""
+        if not self._close_bg_source_loaded:
+            source = cv2.imread(str(self.path_to_bg_img), cv2.IMREAD_COLOR)
+            self._close_bg_source = (
+                cv2.cvtColor(source, cv2.COLOR_BGR2RGB)
+                if source is not None
+                else None
+            )
+            self._close_bg_source_loaded = True
+        return self._close_bg_source
+
+    def render_camera_background(self, camera_bounds):
+        """Render the close-camera background directly at output resolution."""
+        x_min, x_max, y_min, y_max = camera_bounds
+        source = self._load_close_background_source()
+        if source is None:
+            # Match utils.load_bg_img's fallback sky while evaluating its
+            # vertical gradient over the camera's world-coordinate window.
+            top_rgb = np.array([10, 24, 45], dtype=np.float32)
+            bottom_rgb = np.array([150, 185, 215], dtype=np.float32)
+            world_y = np.linspace(
+                y_max, y_min, self.viewport_h, dtype=np.float32
+            )
+            blend = (
+                (self.world_y_max - world_y)
+                / float(self.world_y_max - self.world_y_min)
+            )
+            blend = np.clip(blend, 0.0, 1.0)[:, None]
+            rows = top_rgb[None, :] * (1.0 - blend) + bottom_rgb[None, :] * blend
+            return np.repeat(
+                rows[:, None, :], self.viewport_w, axis=1
+            ).astype(np.uint8)
+
+        source_h, source_w = source.shape[:2]
+        world_width = float(self.world_x_max - self.world_x_min)
+        world_height = float(self.world_y_max - self.world_y_min)
+
+        source_x1 = int(np.floor(
+            (x_min - self.world_x_min) / world_width * source_w
+        ))
+        source_x2 = int(np.ceil(
+            (x_max - self.world_x_min) / world_width * source_w
+        ))
+        # Image rows run downwards while world y runs upwards.
+        source_y1 = int(np.floor(
+            (self.world_y_max - y_max) / world_height * source_h
+        ))
+        source_y2 = int(np.ceil(
+            (self.world_y_max - y_min) / world_height * source_h
+        ))
+        source_x1 = int(np.clip(source_x1, 0, source_w - 1))
+        source_x2 = int(np.clip(source_x2, source_x1 + 1, source_w))
+        source_y1 = int(np.clip(source_y1, 0, source_h - 1))
+        source_y2 = int(np.clip(source_y2, source_y1 + 1, source_h))
+        region = source[source_y1:source_y2, source_x1:source_x2]
+        return cv2.resize(
+            region,
+            (self.viewport_w, self.viewport_h),
+            interpolation=cv2.INTER_CUBIC,
+        )
+
+    def draw_a_polygon(self, canvas, poly, camera_bounds=None):
 
         pts, face_color, edge_color = poly['pts'], poly['face_color'], poly['edge_color']
-        pts_px = self.wd2pxl(pts)
+        pts_px = self.wd2pxl(
+            pts,
+            camera_bounds=camera_bounds,
+            viewport_shape=canvas.shape[:2],
+        )
         if face_color is not None:
             cv2.fillPoly(canvas, [pts_px], color=face_color, lineType=cv2.LINE_AA)
         if edge_color is not None:
@@ -2441,17 +2837,29 @@ class Rocket(object):
         return canvas
 
 
-    def wd2pxl(self, pts, to_int=True):
+    def wd2pxl(self, pts, to_int=True, camera_bounds=None,
+               viewport_shape=None):
 
-        pts_px = np.zeros_like(pts)
+        pts = np.asarray(pts, dtype=np.float64)
+        pts_px = np.zeros_like(pts, dtype=np.float64)
 
-        scale = self.viewport_w / (self.world_x_max - self.world_x_min)
-        for i in range(len(pts)):
-            pt = pts[i]
-            x_p = (pt[0] - self.world_x_min) * scale
-            y_p = (pt[1] - self.world_y_min) * scale
-            y_p = self.viewport_h - y_p
-            pts_px[i] = [x_p, y_p]
+        if camera_bounds is None:
+            x_min, x_max = self.world_x_min, self.world_x_max
+            y_min, y_max = self.world_y_min, self.world_y_max
+        else:
+            x_min, x_max, y_min, y_max = camera_bounds
+
+        if viewport_shape is None:
+            viewport_h, viewport_w = self.viewport_h, self.viewport_w
+        else:
+            viewport_h, viewport_w = viewport_shape
+
+        # Use one metres-to-pixels scale on both axes.  This preserves shape
+        # and matches the original renderer's world projection exactly.
+        scale_x = float(viewport_w) / float(x_max - x_min)
+        scale_y = scale_x
+        pts_px[:, 0] = (pts[:, 0] - x_min) * scale_x
+        pts_px[:, 1] = viewport_h - (pts[:, 1] - y_min) * scale_y
 
         if to_int:
             return pts_px.astype(int)
@@ -2648,6 +3056,128 @@ class Rocket(object):
         roi_x1, roi_x2 = self.viewport_w - 10 - pannel_w, self.viewport_w - 10
         roi_y1, roi_y2 = 10, 10 + pannel_h
         canvas[roi_y1:roi_y2, roi_x1:roi_x2, :] = 0.6*canvas[roi_y1:roi_y2, roi_x1:roi_x2, :] + 0.4*traj_pannel
+
+    def draw_pad_top_view(self, canvas):
+        """Draw a pad-relative top-view projection for the 2-D environment.
+
+        The simulation has no lateral z coordinate, so the vehicle marker is
+        projected onto the pad's horizontal diameter. This is a render-only
+        aid and never enters observations, rewards, or dynamics.
+        """
+        canvas_h, canvas_w = canvas.shape[:2]
+        panel_size = min(220, canvas_h - 20, canvas_w - 20)
+        if panel_size < 120:
+            return
+
+        panel = np.full(
+            (panel_size, panel_size, 3),
+            (238, 242, 246),
+            dtype=np.uint8,
+        )
+        center = (panel_size // 2, int(panel_size * 0.52))
+        outer_radius = max(35, int(panel_size * 0.34))
+        touchdown_radius = max(
+            8,
+            int(outer_radius * 15.0 / max(float(self.target_r), 1.0)),
+        )
+
+        cv2.putText(
+            panel,
+            "PAD TOP - 2D PROJECTION",
+            (8, 19),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.38,
+            (30, 30, 30),
+            1,
+            cv2.LINE_AA,
+        )
+        cv2.circle(panel, center, outer_radius, (85, 85, 85), 2, cv2.LINE_AA)
+        cv2.circle(
+            panel, center, touchdown_radius, (35, 170, 65), 2, cv2.LINE_AA
+        )
+        cv2.line(
+            panel,
+            (center[0] - outer_radius, center[1]),
+            (center[0] + outer_radius, center[1]),
+            (150, 150, 150),
+            1,
+            cv2.LINE_AA,
+        )
+        cv2.line(
+            panel,
+            (center[0], center[1] - outer_radius),
+            (center[0], center[1] + outer_radius),
+            (150, 150, 150),
+            1,
+            cv2.LINE_AA,
+        )
+
+        x = float(self.state['x'])
+        vx = float(self.state['vx'])
+        vy = float(self.state['vy'])
+        theta = float(self.state['theta'])
+        vtheta = float(self.state['vtheta'])
+        display_range = max(float(self.target_r), 15.0)
+        marker_x = int(round(
+            center[0] + np.clip(x / display_range, -1.0, 1.0) * outer_radius
+        ))
+        marker = (marker_x, center[1])
+
+        within_pad = abs(x) <= 15.0
+        kinematics_safe = (
+            np.hypot(vx, vy) < 5.0
+            and abs(theta) < np.deg2rad(5.0)
+            and abs(vtheta) < np.deg2rad(3.0)
+        )
+        if within_pad and kinematics_safe:
+            marker_color = (35, 180, 70)
+            status = "TOUCHDOWN ENVELOPE"
+        elif within_pad:
+            marker_color = (30, 170, 225)
+            status = "PAD - UNSTABLE"
+        else:
+            marker_color = (215, 65, 65)
+            status = "OUTSIDE +/-15 m"
+
+        cv2.line(panel, center, marker, marker_color, 2, cv2.LINE_AA)
+        cv2.circle(panel, marker, 6, marker_color, -1, cv2.LINE_AA)
+        velocity_dx = int(round(np.clip(vx / 10.0, -1.0, 1.0) * 30.0))
+        cv2.arrowedLine(
+            panel,
+            marker,
+            (marker[0] + velocity_dx, marker[1]),
+            (55, 95, 210),
+            2,
+            cv2.LINE_AA,
+            tipLength=0.35,
+        )
+        cv2.putText(
+            panel,
+            f"x={x:+.1f} m  vx={vx:+.1f} m/s",
+            (8, panel_size - 31),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.40,
+            (30, 30, 30),
+            1,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            panel,
+            status,
+            (8, panel_size - 11),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.40,
+            marker_color,
+            1,
+            cv2.LINE_AA,
+        )
+
+        x1 = canvas_w - panel_size - 10
+        y1 = canvas_h - panel_size - 10
+        roi = canvas[y1:y1 + panel_size, x1:x1 + panel_size]
+        canvas[y1:y1 + panel_size, x1:x1 + panel_size] = (
+            0.15 * roi + 0.85 * panel
+        ).astype(np.uint8)
 
 
 
